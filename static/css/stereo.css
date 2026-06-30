@@ -1,0 +1,70 @@
+/* Side-by-side stereo (SBS) layout */
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+
+.stereo-nav {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #111;
+  border-bottom: 1px solid #222;
+  font-size: 13px;
+}
+
+.back-link {
+  color: #6cf;
+  text-decoration: none;
+}
+
+.stereo-status {
+  margin-left: auto;
+  color: #4f8;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+/* Container: full-screen side-by-side layout */
+.stereo-wrap {
+  position: relative;
+  width: 100vw;
+  height: calc(100vh - 37px);
+  background: #000;
+  display: flex;
+}
+
+/* HTTP mode: single wide image */
+.stereo-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* WebRTC mode: two video halves */
+.eye {
+  position: relative;
+  width: 50%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+}
+
+.eye video {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 200%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Left eye: show left half (translateX 0) */
+/* Right eye: show right half (translateX -50%) */
+.eye.right video {
+  transform: translateX(-50%);
+}

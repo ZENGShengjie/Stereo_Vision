@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Performance — Stereo Vision</title>
+  <link rel="stylesheet" href="/static/css/common.css">
+  <style>
+    body { background: #0d0d0d; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+
+    .page-header { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+    .page-header h1 { margin: 0; color: #fff; font-size: 24px; }
+    .back-link { color: #6cf; font-size: 14px; }
+
+    /* FPS / latency top row */
+    .top-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .metric-card {
+      background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
+      padding: 16px; text-align: center;
+    }
+    .metric-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }
+    .metric-value { font-size: 28px; font-weight: 700; font-family: "Courier New", monospace; color: #fff; }
+    .metric-unit { font-size: 13px; color: #888; font-weight: 400; }
+    .metric-value.good { color: #4f8; }
+    .metric-value.warn { color: #f80; }
+    .metric-value.bad  { color: #f44; }
+
+    /* Stage breakdown */
+    .stage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+    .stage-section { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; }
+    .stage-section h3 { margin: 0 0 12px; font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
+    .stage-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .stage-name { font-size: 12px; color: #aaa; width: 72px; flex-shrink: 0; }
+    .stage-bar-bg { flex: 1; height: 8px; background: #2a2a2a; border-radius: 4px; overflow: hidden; }
+    .stage-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s ease; }
+    .stage-ms { font-size: 11px; color: #888; width: 42px; text-align: right; flex-shrink: 0; font-family: monospace; }
+
+    /* Latency scatter chart area */
+    .chart-section { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+    .chart-section h3 { margin: 0 0 12px; font-size: 13px; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
+    .chart-canvas-wrap { position: relative; height: 120px; }
+    #latChart { width: 100%; height: 120px; display: block; }
+
+    /* Info row */
+    .info-row { display: flex; gap: 12px; font-size: 13px; color: #666; }
+    .info-row span { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 6px 12px; }
+
+    /* Depth display */
+    .depth-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    .depth-badge { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px 20px; font-size: 20px; font-family: monospace; }
+    .depth-badge .unit { font-size: 13px; color: #888; }
+    .depth-badge.has-value { color: #6cf; border-color: #6cf4; }
+    .depth-badge.no-value { color: #666; }
+
+    /* Refresh indicator */
+    .refresh-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #2a2a2a; margin-left: 8px; vertical-align: middle; }
+    .refresh-dot.active { background: #4f8; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+    /* Depth calibration */
+    .depth-badge { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 12px 20px; font-size: 18px; font-family: monospace; }
+    .depth-badge .unit { font-size: 13px; color: #888; }
+    .depth-badge.has-value { color: #6cf; border-color: #6cf4; }
+    .depth-badge.no-value { color: #666; }
+
+    .calib-section { background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    .calib-section-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .calib-section-header h3 { margin: 0; font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 0.08em; }
+    .calib-hint { font-size: 12px; color: #555; }
+    .calib-body { display: flex; flex-direction: column; gap: 10px; }
+    .calib-input-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .calib-label { font-size: 13px; color: #aaa; white-space: nowrap; }
+    .calib-input { background: #111; border: 1px solid #333; border-radius: 4px; color: #e0e0e0; padding: 6px 10px; font-size: 14px; width: 100px; }
+    .calib-input:focus { border-color: #6cf; outline: none; }
+    .calib-btn { background: #6cf; color: #000; border: none; border-radius: 4px; padding: 7px 16px; font-size: 13px; cursor: pointer; font-weight: 600; }
+    .calib-btn:hover { background: #9df; }
+    .calib-btn:disabled { opacity: 0.4; cursor: default; }
+    .calib-result { font-size: 13px; padding: 8px 12px; border-radius: 4px; margin-top: 4px; }
+    .calib-result.ok { background: #0d2a1a; color: #4f8; border: 1px solid #2a6; }
+    .calib-result.err { background: #2a0d0d; color: #f44; border: 1px solid #a22; }
+    .scale-table-wrap { margin-top: 4px; }
+    .scale-table-label { font-size: 12px; color: #555; margin-bottom: 6px; }
+    .scale-table { border-collapse: collapse; font-size: 12px; font-family: monospace; }
+    .scale-table th { color: #555; font-weight: 400; padding: 2px 10px 2px 0; text-align: left; }
+    .scale-table td { color: #aaa; padding: 2px 10px 2px 0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="page-header">
+      <h1>Performance Monitor</h1>
+      <a href="/" class="back-link">&#8592; Home</a>
+      <span class="refresh-dot" id="refreshDot"></span>
+    </div>
+
+    <!-- Top-level metrics -->
+    <div class="top-row">
+      <div class="metric-card">
+        <div class="metric-label">FPS</div>
+        <div class="metric-value" id="fpsVal">--</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Latency P50</div>
+        <div class="metric-value" id="latP50">--<span class="metric-unit"> ms</span></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Latency P95</div>
+        <div class="metric-value" id="latP95">--<span class="metric-unit"> ms</span></div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Latency Max</div>
+        <div class="metric-value" id="latMax">--<span class="metric-unit"> ms</span></div>
+      </div>
+    </div>
+
+    <!-- Stage breakdown -->
+    <div class="stage-grid">
+      <div class="stage-section">
+        <h3>Per-Stage Avg (last 60 frames)</h3>
+        <div id="stageRows"></div>
+      </div>
+      <div class="stage-section">
+        <h3>Total vs Available Time</h3>
+        <div id="budgetRows"></div>
+      </div>
+    </div>
+
+    <!-- Latency chart -->
+    <div class="chart-section">
+      <h3>Frame Latency — Rolling 60 Frames</h3>
+      <div class="chart-canvas-wrap">
+        <canvas id="latChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Depth & calibration -->
+    <div class="depth-row">
+      <div class="depth-badge no-value" id="depthBadge">
+        <span id="depthVal">--</span> <span class="unit">cm measured</span>
+      </div>
+      <div class="depth-badge no-value" id="dMedianBadge">
+        <span id="dMedianVal">--</span> <span class="unit">px disparity</span>
+      </div>
+      <div class="depth-badge no-value" id="scaleBadge">
+        DISP_SCALE: <span id="scaleVal">1.0</span>
+      </div>
+      <div class="depth-badge no-value" id="confBadge">
+        MATCH: <span id="confVal">--</span>
+      </div>
+    </div>
+
+    <!-- Calibration section -->
+    <div class="calib-section">
+      <div class="calib-section-header">
+        <h3>Depth Calibration</h3>
+        <span id="calibHint" class="calib-hint">Place cup at known distance, then enter real cm below</span>
+      </div>
+      <div class="calib-body">
+        <div class="calib-input-row">
+          <label class="calib-label">Real distance (cm):</label>
+          <input type="number" id="realCmInput" class="calib-input" placeholder="e.g. 25" min="1" max="500" step="0.1">
+          <button id="calibrateBtn" class="calib-btn">Apply Calibration</button>
+        </div>
+        <div id="calibResult" class="calib-result" hidden></div>
+        <div id="scaleTable" class="scale-table-wrap" hidden>
+          <div class="scale-table-label">Suggested SCALE for reference distances:</div>
+          <table class="scale-table">
+            <thead><tr><th>Real cm</th><th>SCALE</th></tr></thead>
+            <tbody id="scaleTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="info-row">
+      <span id="winInfo">window: -- frames</span>
+      <span id="targetInfo">target: -- ms/frame</span>
+      <span id="updInfo">updated: --</span>
+    </div>
+  </div>
+
+  <script src="/static/js/perf_panel.js"></script>
+</body>
+</html>

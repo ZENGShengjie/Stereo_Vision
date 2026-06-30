@@ -1,0 +1,129 @@
+.params-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.param-group {
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.param-group h3 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #888;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.param-label {
+  width: 72px;
+  font-size: 13px;
+  color: #aaa;
+  flex-shrink: 0;
+}
+
+.param-row input[type="range"] {
+  flex: 1;
+  cursor: pointer;
+  accent-color: #6cf;
+}
+
+.param-value {
+  width: 48px;
+  text-align: right;
+  font-size: 13px;
+  font-family: monospace;
+  color: #6cf;
+}
+
+.param-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.btn-primary, .btn-secondary {
+  padding: 10px 20px;
+  border-radius: 6px;
+  border: none;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: #6cf;
+  color: #000;
+  font-weight: 600;
+}
+.btn-primary:hover { background: #9df; }
+
+.btn-secondary {
+  background: #2a2a2a;
+  color: #ccc;
+  border: 1px solid #3a3a3a;
+}
+.btn-secondary:hover { border-color: #6cf; color: #6cf; }
+
+#loading-msg { color: #888; font-size: 14px; }
+
+/* Two-column layout for control page */
+.control-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  align-items: start;
+}
+
+@media (max-width: 700px) {
+  .control-layout { grid-template-columns: 1fr; }
+}
+
+.control-form-col { min-width: 0; }
+.control-preview-col { position: sticky; top: 16px; }
+
+.preview-label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.preview-wrap {
+  background: #111;
+  border: 1px solid #2a2a2a;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.preview-wrap img {
+  width: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.preview-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #555;
+}
+
+.apply-msg {
+  margin-top: 8px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.apply-msg.ok   { background: #1a2e1a; color: #4f8; border: 1px solid #2a6; }
+.apply-msg.err  { background: #2e1a1a; color: #f44; border: 1px solid #c00; }
+

@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+*.log
+*.pem
+!config/*.pem.example
+data/params*.json
+
+# IDE
+.cursor/
+
+# Calibration artifacts — large, environment-specific, regenerated from calib capture
+config/calibration/calib.npz
+config/calibration/_debug/
+
+# Runtime / debug output
+logs/
+debug-c7ffa8.log
+diag_frames/
+diag_frames2/
+diag_frames3/
+diag_frames4/
+diag_frames5/
+diag_frames6/
+
+# ML model weights — large, downloaded by tooling, not source
+*.pt
+*.onnx
+
+# Throwaway installers
+*.exe

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Stereo Vision</title>
+  <link rel="stylesheet" href="/static/css/common.css">
+</head>
+<body>
+  <div class="container">
+    <h1>Stereo Vision</h1>
+    <p>Remote HCR — Binocular VR Video Service</p>
+
+    <div class="nav-grid">
+      <a class="card" href="/?transport=webrtc&mode=video">
+        <div class="card-icon">&#9654;</div>
+        <div class="card-title">WebRTC Video</div>
+        <div class="card-desc">Low-latency stereo via WebRTC (recommended)</div>
+      </a>
+      <a class="card" href="/stereo?transport=http&mode=video">
+        <div class="card-icon">&#9654;</div>
+        <div class="card-title">HTTP Video</div>
+        <div class="card-desc">MJPEG over HTTP (debugging, easy to open)</div>
+      </a>
+      <a class="card" href="/depth">
+        <div class="card-icon">&#9632;</div>
+        <div class="card-title">Depth View</div>
+        <div class="card-desc">Depth map visualization</div>
+      </a>
+      <a class="card" href="/debug">
+        <div class="card-icon">&#9881;</div>
+        <div class="card-title">Debug</div>
+        <div class="card-desc">Raw frame + FPS + latency</div>
+      </a>
+      <a class="card" href="/control">
+        <div class="card-icon">&#9776;</div>
+        <div class="card-title">Control Panel</div>
+        <div class="card-desc">Adjust crop, shift, distortion, separator</div>
+      </a>
+    </div>
+
+    <div id="camera-status" class="status-bar">
+      Camera: checking...
+    </div>
+  </div>
+
+  <script>
+    (async function() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        const el = document.getElementById('camera-status');
+        if (data.zed === 'open') {
+          el.textContent = 'Camera: ZED connected';
+          el.className = 'status-bar status-ok';
+        } else {
+          el.textContent = 'Camera: not available';
+          el.className = 'status-bar status-warn';
+        }
+      } catch(e) {
+        document.getElementById('camera-status').textContent = 'Camera: unreachable';
+      }
+    })();
+  </script>
+</body>
+</html>

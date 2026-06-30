@@ -1,0 +1,18 @@
+aiohttp>=3.9.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# WebRTC support (required for video track streaming)
+aiortc>=1.9.0
+av>=10.0.0
+
+# Stage 1 cup detection: YOLOv8s COCO-pretrained, ID=41 cup
+# ultralytics auto-pulls torch (~750MB CPU build). For GPU build see docs/INSTALL.md.
+ultralytics>=8.0.0
+ultralytics-thop>=2.0.0  # ultralytics 强依赖,thop(model FLOPs analyser)
+
+# ZED SDK (NOT pip-installable — see docs/INSTALL.md)
+# pyzed.sl comes with the ZED SDK installer from stereolabs.com
+# After installing ZED SDK, add its Python API to your environment:
+#   export PYTHONPATH=$PYTHONPATH:/usr/local/zed
+#   # or on Windows: set PYTHONPATH=%PYTHONPATH%;C:\Program Files\Stereolabs\ZED\scripts

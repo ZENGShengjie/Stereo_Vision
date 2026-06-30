@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Debug — Stereo Vision</title>
+  <link rel="stylesheet" href="/static/css/common.css">
+  <style>
+    body { background: #111; color: #eee; }
+    .debug-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 12px; }
+    .debug-card { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; padding: 12px; }
+    .debug-card h3 { margin: 0 0 8px; font-size: 14px; color: #aaa; }
+    .debug-value { font-size: 24px; font-family: monospace; }
+    .stereo-img { width: 100%; display: block; }
+  </style>
+</head>
+<body>
+  <div class="nav-bar">
+    <a href="/" class="back-link" style="color:#6cf">&#8592; Home</a>
+    <span>Debug</span>
+  </div>
+  <div class="debug-grid">
+    <div class="debug-card">
+      <h3>Camera</h3>
+      <div class="debug-value" id="dbg-camera">loading...</div>
+    </div>
+    <div class="debug-card">
+      <h3>FPS</h3>
+      <div class="debug-value" id="dbg-fps">--</div>
+    </div>
+    <div class="debug-card">
+      <h3>Transport</h3>
+      <div class="debug-value" id="dbg-transport">MJPEG</div>
+    </div>
+    <div class="debug-card">
+      <h3>Frame Size</h3>
+      <div class="debug-value" id="dbg-size">--</div>
+    </div>
+  </div>
+  <div style="padding: 0 12px 12px;">
+    <img id="debug-img" class="stereo-img" src="/video_feed">
+  </div>
+  <script>
+    (async function() {
+      const data = await (await fetch('/api/status')).json();
+      document.getElementById('dbg-camera').textContent = data.zed;
+    })();
+    const img = document.getElementById('debug-img');
+    let last = Date.now(), count = 0;
+    img.addEventListener('load', function() {
+      count++;
+      const now = Date.now();
+      if (now - last >= 1000) {
+        document.getElementById('dbg-fps').textContent = count;
+        document.getElementById('dbg-size').textContent = img.naturalWidth + 'x' + img.naturalHeight;
+        count = 0; last = now;
+      }
+    });
+  </script>
+</body>
+</html>
