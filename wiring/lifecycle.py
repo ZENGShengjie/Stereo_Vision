@@ -192,7 +192,7 @@ def _open_camera(app: web.Application) -> None:
     else:
         app[FRAME_QUEUE_KEY] = None
         app[PIPELINE_KEY] = None
-    app[SBS_QUEUE_KEY] = None
+        app[SBS_QUEUE_KEY] = None
 
 
 async def _close_camera(app: web.Application) -> None:
