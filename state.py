@@ -7,9 +7,13 @@ WEBRTC_PEERS_KEY = "stereo_webrtc_peers"
 CAMERA_KEY = "stereo_camera"
 STEREO_AVAILABLE_KEY = "stereo_available"
 PIPELINE_KEY = "stereo_pipeline"
-"""SBSPipeline 实例的 app state key;启动后由 wiring.lifecycle 写入。"""
+FRAME_QUEUE_KEY = "stereo_frame_queue"
+"""LatestFrameQueue — written by camera capture thread, read by SBSPipeline."""
+SBS_QUEUE_KEY = "stereo_sbs_queue"
+"""LatestSBSQueue — written by SBSPipeline after processing, read by MJPEG/WebRTC."""
 
-APP_STATE_KEYS = [WEBRTC_PEERS_KEY, CAMERA_KEY, STEREO_AVAILABLE_KEY, PIPELINE_KEY]
+
+APP_STATE_KEYS = [WEBRTC_PEERS_KEY, CAMERA_KEY, STEREO_AVAILABLE_KEY, PIPELINE_KEY, FRAME_QUEUE_KEY, SBS_QUEUE_KEY]
 
 
 def init_app_state(app: Any) -> None:
@@ -18,8 +22,10 @@ def init_app_state(app: Any) -> None:
     - ``stereo_pipeline`` 由 :mod:`wiring.lifecycle` 启动时写入 SBSPipeline。
     - ``stereo_camera`` 由 lifecycle 写入 USBCamera / ZEDCamera 实例。
     - ``stereo_webrtc_peers`` 用于 WebRTC 端点管理。
+    - ``stereo_frame_queue`` LatestFrameQueue 由 lifecycle 写入，摄像头线程写入，SBSPipeline 读取。
     """
     app[WEBRTC_PEERS_KEY] = {}
     app[CAMERA_KEY] = None
     app[STEREO_AVAILABLE_KEY] = False
     app[PIPELINE_KEY] = None
+    app[FRAME_QUEUE_KEY] = None

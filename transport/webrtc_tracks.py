@@ -2,54 +2,68 @@
 
 ZEDTrack is lazily imported to avoid a hard aiortc dependency at import time.
 """
+from __future__ import annotations
 
 from .mjpeg_stream import mjpeg_generator
 
 __all__ = ["ZEDTrack", "mjpeg_generator"]
 
 
-def ZEDTrack(frame_fn, fps=15, fallback_shape=(480, 640, 3)):
-    """Lazily import and return a ZEDTrack instance."""
+def ZEDTrack(frame_fn_or_queue, fps=15, fallback_shape=(480, 640, 3)):
+    """Lazily import and return a ZEDTrack instance.
+
+    After the pipeline refactor, frame_fn_or_queue is a LatestSBSQueue instance.
+    Each ZEDTrack pulls from the shared queue in recv() — no local capture
+    thread, no redundant pipeline runs per client.
+
+    Kept for backwards compatibility: if a plain callable frame_fn is passed
+    (old calling convention), behaviour is unchanged.
+    """
     from aiortc import VideoStreamTrack
     from av import VideoFrame
     import numpy as np
-    import threading
     import time
 
+    # Detect whether we received a LatestSBSQueue or a plain frame_fn
+    from wiring.frame_queue import LatestSBSQueue
+    _is_queue = isinstance(frame_fn_or_queue, LatestSBSQueue)
+
     class _ZEDTrack(VideoStreamTrack):
-        def __init__(self, _frame_fn, _fps, _shape):
+        def __init__(self, _fps, _shape):
             super().__init__()
-            self._frame_fn = _frame_fn
             self._fps = _fps
+            self._shape = _shape
             self._period = 1.0 / _fps
-            self._latest = None
-            self._last = None
-            self._running = True
+            self._last_send = 0.0
 
-            t = threading.Thread(target=self._capture_loop, daemon=True)
-            t.start()
-
-        def _capture_loop(self):
-            while self._running:
+        def _pull_frame(self):
+            if _is_queue:
+                result = frame_fn_or_queue.pull()
+                if result is not None:
+                    return result[0]   # (frame, timestamp)
+                return None
+            else:
                 try:
-                    arr = self._frame_fn()
-                    if arr is not None:
-                        self._latest = arr
-                        self._last = arr
+                    return frame_fn_or_queue()
                 except Exception:
-                    pass
-                time.sleep(self._period)
+                    return None
 
         async def recv(self):
             import cv2
-            arr = self._latest
-            if arr is None:
-                arr = self._last
-            if arr is None:
-                arr = np.zeros(_shape, dtype=np.uint8)
+            # Rate-limit: sleep until the next frame slot
+            now = time.monotonic()
+            wait = self._period - (now - self._last_send)
+            if wait > 0:
+                import asyncio
+                await asyncio.sleep(wait)
+            self._last_send = time.monotonic()
 
-            if arr.shape != _shape:
-                arr = cv2.resize(arr, (_shape[1], _shape[0]))
+            arr = self._pull_frame()
+            if arr is None:
+                arr = np.zeros(self._shape, dtype=np.uint8)
+
+            if arr.shape != self._shape:
+                arr = cv2.resize(arr, (self._shape[1], self._shape[0]))
 
             frame = VideoFrame.from_ndarray(arr, format="bgr24")
             pts, time_base = await self.next_timestamp()
@@ -58,11 +72,10 @@ def ZEDTrack(frame_fn, fps=15, fallback_shape=(480, 640, 3)):
             return frame
 
         def stop(self):
-            self._running = False
             try:
                 super().stop()
             except Exception:
                 pass
             print("[ZEDTrack] stopped")
 
-    return _ZEDTrack(frame_fn, fps, fallback_shape)
+    return _ZEDTrack(fps, fallback_shape)

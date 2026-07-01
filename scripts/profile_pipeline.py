@@ -122,6 +122,10 @@ def main() -> None:
     from config import USB_LEFT_INDEX, USB_RIGHT_INDEX, USB_TARGET_WIDTH, USB_TARGET_HEIGHT
     from camera.usb_camera import USBCamera
     from processing.sbs_pipeline import SBSPipeline
+    from wiring.frame_queue import LatestFrameQueue, LatestSBSQueue
+    from processing.detector import CupDetector
+    from processing.stereo_depth import StereoDepthSolver
+    from processing.warning import WarningOverlay
 
     print(f"  Camera: left={USB_LEFT_INDEX}, right={USB_RIGHT_INDEX}")
     print(f"  Resolution: {USB_TARGET_WIDTH}x{USB_TARGET_HEIGHT}")
@@ -140,11 +144,17 @@ def main() -> None:
         return
 
     try:
+        frame_queue = LatestFrameQueue()
+        sbs_queue = LatestSBSQueue()
+        detector = CupDetector()
+        solver = StereoDepthSolver()
+        warn = WarningOverlay()
         pipeline = SBSPipeline(
-            left_index=USB_LEFT_INDEX,
-            right_index=USB_RIGHT_INDEX,
-            target_width=USB_TARGET_WIDTH,
-            target_height=USB_TARGET_HEIGHT,
+            frame_queue=frame_queue,
+            sbs_queue=sbs_queue,
+            detector=detector,
+            solver=solver,
+            warn=warn,
         )
         print("  Pipeline initialized OK (YOLO warmup done)")
     except Exception as e:
@@ -168,8 +178,13 @@ def main() -> None:
     sgbm_times = []
 
     for i in range(args.frames):
+        # 直接喂帧(绕开队列,profiler 独立控制节奏)
+        rect = cam.read_rectified_pair()
+        if rect is None:
+            continue
+        left, right = rect
         t_start = time.perf_counter()
-        result = pipeline.process_one_frame()
+        result = pipeline.process_one_frame(left, right)
         t_end = time.perf_counter()
 
         if result is not None:

@@ -65,8 +65,6 @@ from config.hardware import (
     SBS_HEIGHT,
     SBS_WIDTH,
 )
-from camera.calibration import StereoCalibrator
-from camera.usb_camera import USBCamera
 from processing.detector import CupDetector
 from processing.stereo_depth import StereoDepthSolver
 from processing.warning import Box, WarningOverlay
@@ -97,11 +95,23 @@ def _fuse_depths(depths: list[Optional[float]]) -> Optional[float]:
 
 
 class SBSPipeline:
-    """一帧总入口:raw -> 校正 -> YOLO(双眼) -> SGBM -> 预警 -> 3840x1080 SBS。
+    """一帧总入口:raw -> 校正 -> YOLO(双眼) -> SGBM -> 预警 -> 3840x1080 SBS.
+
+    解耦后的数据流:
+        LatestFrameQueue  ──pull()──  process_one_frame()
+                                                     │
+                                         push(SBS frame) to
+                                                     │
+                                                  LatestSBSQueue
+                                                     ▲
+                           MJPEG / WebRTC ──────────┘
+
+    旧架构中每个 MJPEG 请求 / 每个 WebRTC 客户端独立跑 YOLO×2 + SGBM,
+    现在所有消费者共享 SBSPipeline 的处理结果。
 
     Args:
-        camera: USB 摄像头实例(单设备 SBS 模式)。
-        calibrator: 双目立体校正器(可为 None,降级)。
+        frame_queue: LatestFrameQueue 实例,摄像头线程往里写已校正的左右图。
+        sbs_queue: LatestSBSQueue 实例,管线处理完后往里写 SBS 帧。
         detector: cup 检测器(单例)。
         solver: SGBM 视差 + 深度解算器。
         warn: 预警渲染器。
@@ -109,14 +119,14 @@ class SBSPipeline:
 
     def __init__(
         self,
-        camera: USBCamera,
-        calibrator: Optional[StereoCalibrator],
+        frame_queue,
+        sbs_queue,
         detector: CupDetector,
         solver: StereoDepthSolver,
         warn: WarningOverlay,
     ) -> None:
-        self._camera = camera
-        self._calibrator = calibrator or camera._calibrator
+        self._frame_queue = frame_queue
+        self._sbs_queue = sbs_queue
         self._detector = detector
         self._solver = solver
         self._warn = warn
@@ -130,23 +140,34 @@ class SBSPipeline:
         self._stats_lock = Lock()
         self._stats_ring: deque[dict] = deque(maxlen=_STATS_RING_SIZE)
 
-    def process_one_frame(self) -> Optional[np.ndarray]:
-        """读一帧,跑完整管线,返回 SBS BGR 图 (1080, 3840, 3)。
+    def process_one_frame(
+        self,
+        left: Optional[np.ndarray] = None,
+        right: Optional[np.ndarray] = None,
+    ) -> Optional[np.ndarray]:
+        """处理一帧。
 
-        失败(摄像头断开等)返回 ``None``。
+        双入口模式:
+        - 有 left/right 参数时:直接用这两帧(standalone profiler 用,无需队列)。
+        - 无参数时:从 LatestFrameQueue 拉最新帧(web 服务用,摄像头线程往里写)。
+
+        Returns:
+            SBS BGR 图 (1080, 3840, 3) 或 None(无新帧时跳过)。
         """
-        t0 = time.perf_counter()
-        self._frames += 1
+        # 0. 获得已校正帧
+        if left is not None and right is not None:
+            # 直接喂帧模式(standalone profiler / 测试用)
+            rect = (left, right)
+        else:
+            # 队列模式(生产服务用)
+            rect = self._frame_queue.pull()
+            if rect is None:
+                return None  # 摄像头速率 > 处理速率时,旧帧被静默丢弃
 
-        # 1. 读已校正左右单眼图
-        try:
-            rect = self._camera.read_rectified_pair()
-        except Exception as ex:  # noqa: BLE001
-            logger.warning("[SBSPipeline] read_rectified_pair failed: %s", ex)
-            return None
-        if rect is None:
-            return None
         left, right = rect
+        self._frames += 1
+        t0 = time.perf_counter()
+
         # 防御:确保 shape 是 mono 尺寸
         if left.shape[:2] != (MONO_HEIGHT, MONO_WIDTH):
             logger.error(
@@ -191,10 +212,13 @@ class SBSPipeline:
         )
         # #endregion
 
-        # 3. SGBM 视差(一次性算 left/right 整张图,左右眼共享同一视差图)
+        # 3. 构建 YOLO 检测框的 ROI mask 并传进 SGBM
+        #    - 有 box 时:只在 box 内外扩 MARGIN% 的区域内搜索 → 减少背景噪声干扰
+        #    - 无 box 时:退化为整图 SGBM(向后兼容)
+        roi_mask = self._build_roi_mask(box_l, box_r)
         t4 = time.perf_counter()
         try:
-            disp = self._solver.compute(left, right)
+            disp = self._solver.compute(left, right, roi_mask=roi_mask)
         except Exception as ex:  # noqa: BLE001
             logger.warning("[SBSPipeline] solver.compute failed: %s", ex)
             disp = None
@@ -290,6 +314,9 @@ class SBSPipeline:
         with self._stats_lock:
             self._stats_ring.append(record)
 
+        # 7. 推 SBS 到共享队列(MJPEG/WebRTC 从这里读,不再各自跑管线)
+        self._sbs_queue.push(sbs)
+
         return sbs
 
     @property
@@ -365,7 +392,7 @@ class SBSPipeline:
             "d_median_px": d_med,
             "z_measured_cm": z_raw,
             "match_confidence": self._solver.match_confidence,
-            "calib_points": [(round(s, 2), round(t, 2)) for s, t in self._solver._calib_points],
+            "calib_points": [(round(s, 2), round(t, 2)) for s, t in self._solver.calib_points],
             "suggested_disp_scales": suggested_scales,
         }
 
@@ -394,6 +421,45 @@ class SBSPipeline:
             "CALIB",
         )
         return {"calib_points": pts, "sensor_z_cm": sensor_z_cm, "true_z_cm": true_z_cm}
+
+    # ── ROI mask 辅助 ─────────────────────────────────────────────────────────
+
+    ROI_MARGIN_RATIO: float = 0.20  # box 外扩 20%
+
+    def _build_roi_mask(
+        self,
+        box_l: Optional[tuple[int, int, int, int]],
+        box_r: Optional[tuple[int, int, int, int]],
+    ) -> Optional[np.ndarray]:
+        """把左右检测框合并成一个 ROI mask。
+
+        Returns:
+            shape=(MONO_HEIGHT, MONO_WIDTH), dtype=uint8。
+            255=感兴趣区域,0=忽略区域。
+            两框都没有时返回 None（退化为整图 SGBM）。
+        """
+        if box_l is None and box_r is None:
+            return None
+
+        mask = np.zeros((MONO_HEIGHT, MONO_WIDTH), dtype=np.uint8)
+
+        def _fill_box(box: tuple[int, int, int, int]) -> None:
+            x1, y1, x2, y2 = box
+            # 外扩 MARGIN%
+            mx = int((x2 - x1) * self.ROI_MARGIN_RATIO)
+            my = int((y2 - y1) * self.ROI_MARGIN_RATIO)
+            x1 = max(0, x1 - mx)
+            y1 = max(0, y1 - my)
+            x2 = min(MONO_WIDTH, x2 + mx)
+            y2 = min(MONO_HEIGHT, y2 + my)
+            mask[y1:y2, x1:x2] = 255
+
+        if box_l is not None:
+            _fill_box(box_l)
+        if box_r is not None:
+            _fill_box(box_r)
+
+        return mask
 
 
 __all__ = ["SBSPipeline"]

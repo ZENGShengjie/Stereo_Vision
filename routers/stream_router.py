@@ -27,35 +27,37 @@ from config import (
     build_webrtc_client_config,
     create_rtc_configuration,
 )
-from state import PIPELINE_KEY, WEBRTC_PEERS_KEY
+from state import CAMERA_KEY, PIPELINE_KEY, SBS_QUEUE_KEY, WEBRTC_PEERS_KEY
 from transport import ZEDTrack
 from transport.mjpeg_stream import mjpeg_generator_async
 from utils import timestamped_print
 
 
 def _build_frame_fn(app: web.Application):
-    """统一构造 ``frame_fn`` 闭包。
+    """Build a frame_fn that reads from the shared LatestSBSQueue.
 
-    优先 ``app[PIPELINE_KEY]``;否则回退到 ``cam.read_stereo()``。
-    永远返回 ``np.ndarray | None``。
+    Before refactor: each MJPEG request / each WebRTC client called
+    pipeline.process_one_frame() independently → N copies of YOLO×2 + SGBM.
+    After refactor: SBSPipeline pushes to LatestSBSQueue; this fn just
+    pulls from the queue (O(1), no recompute).
+    Falls back to camera.read_stereo() if the queue is unavailable.
     """
-    pipeline = app.get(PIPELINE_KEY)
-    cam = app.get("stereo_camera")
+    sbs_queue = app.get(SBS_QUEUE_KEY)
+    cam = app.get(CAMERA_KEY)
 
-    if pipeline is not None:
+    if sbs_queue is not None:
         def frame_fn():
-            try:
-                return pipeline.process_one_frame()
-            except Exception as ex:  # noqa: BLE001
-                timestamped_print(f"[stream] pipeline frame error: {ex}")
-                return None
+            result = sbs_queue.pull()
+            if result is not None:
+                return result[0]  # (frame, timestamp)
+            return None
         return frame_fn
 
     if cam is not None:
         def frame_fn():
             try:
                 return cam.read_stereo()
-            except Exception as ex:  # noqa: BLE001
+            except Exception as ex:
                 timestamped_print(f"[stream] cam read_stereo error: {ex}")
                 return None
         return frame_fn
@@ -114,8 +116,8 @@ async def mjpeg_feed_handler(request: web.Request) -> web.Response:
         pass  # noqa: silence unused
 
     if (
-        request.app.get(PIPELINE_KEY) is None
-        and request.app.get("stereo_camera") is None
+        request.app.get(SBS_QUEUE_KEY) is None
+        and request.app.get(CAMERA_KEY) is None
     ):
         return web.Response(text="Camera not available", status=503)
 
@@ -195,20 +197,21 @@ async def webrtc_signaling_handler(request: web.Request) -> web.Response:
                         await _close_peer(request.app, pc)
 
                 if (
-                    request.app.get(PIPELINE_KEY) is None
-                    and request.app.get("stereo_camera") is None
+                    request.app.get(SBS_QUEUE_KEY) is None
+                    and request.app.get(CAMERA_KEY) is None
                 ):
                     await ws.send_json(
                         {"type": "error", "message": "Camera not available"}
                     )
                     continue
 
-                frame_fn = _build_frame_fn(request.app)
-
-                # WebRTC 输出形状 = (SBS_HEIGHT, SBS_WIDTH, 3) = (1080, 3840, 3)
-                webrtc_fps = min(USB_FPS, WEBRTC_MAX_FRAMERATE)
-                fallback_shape = (SBS_HEIGHT, SBS_WIDTH, 3)
-                track = ZEDTrack(frame_fn, fps=webrtc_fps, fallback_shape=fallback_shape)
+                # After refactor: pass LatestSBSQueue directly to ZEDTrack
+                # (each ZEDTrack.recv() pulls from shared queue — no recompute)
+                sbs_queue = request.app.get(SBS_QUEUE_KEY)
+                if sbs_queue is not None:
+                    track = ZEDTrack(sbs_queue, fps=webrtc_fps, fallback_shape=fallback_shape)
+                else:
+                    track = ZEDTrack(frame_fn, fps=webrtc_fps, fallback_shape=fallback_shape)
                 peers[pc] = track
                 sender = pc.addTrack(track)
 

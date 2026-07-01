@@ -117,35 +117,12 @@ class USBCamera(StereoCameraBase):
         # 单设备模式：左右索引相同，同一个摄像头输出左右拼接帧
         self._single_device = (left_index == right_index)
 
-        # SGBM 在小分辨率上跑，精度更高、速度更快
-        self._sgbm_width = 320
-        self._sgbm_height = 240
-        # 参数调优思路：
-        # numDisparities=64（视差级别少→匹配更鲁棒，覆盖率高）
-        # blockSize=5（小窗口→更多匹配点，但噪点多）
-        # speckleWindowSize=0（关闭散斑过滤，避免误删有效像素）
-        # uniquenessRatio=5（放宽唯一性约束，提高覆盖率）
-        self._stereo_matcher = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=64,
-            blockSize=5,
-            P1=8 * 3 * 1,
-            P2=32 * 3 * 1,
-            disp12MaxDiff=1,
-            uniquenessRatio=5,
-            speckleWindowSize=0,
-            speckleRange=0,
-            mode=cv2.STEREO_SGBM_MODE_SGBM,
-        )
-        # 深度 d(m) = f * b / disp(像素)
-        # focal_px 与图像宽度成正比：1920 / 640 = 3x，旧值 800 → 2400（视场角不变）
-        # 实际使用时请用真实标定值替换
-        self._focal = 2400.0
-        self._baseline = 0.06
-        self._rectified_l: np.ndarray | None = None
-        self._rectified_r: np.ndarray | None = None
-        self._last_depth: np.ndarray | None = None
-        self._last_confidence: np.ndarray | None = None
+        # Note: StereoSGBM, depth computation, focal, baseline are no longer
+        # defined here.  The SBSPipeline uses processing.stereo_depth.StereoDepthSolver
+        # (a separate, better-configured SGBM instance) instead.
+        # The old _compute_depth() method has been removed — it was dead code
+        # (never called by any consumer in the refactored wiring/lifecycle).
+        self._status = USBStatus.OPEN
 
         if self._single_device:
             self._cap = self._open_single()
@@ -187,8 +164,6 @@ class USBCamera(StereoCameraBase):
                 raise RuntimeError(f"Right camera (index {right_index}) failed to read frames")
 
             self._cap = None
-
-        self._status = USBStatus.OPEN
 
         # 阶段 0:加载立体校正器。无 npz 时降级为直通(警告已由 calibrator 自己打印)。
         self._calibrator: StereoCalibrator = StereoCalibrator(
@@ -314,30 +289,10 @@ class USBCamera(StereoCameraBase):
     ) -> tuple[np.ndarray, np.ndarray]:
         """用 ``StereoCalibrator`` 对左右单眼图做极线校正。
 
-        若 calibrator 未加载(npz 缺失),``StereoCalibrator.rectify`` 会
-        降级直传,行为等价于不做校正(精度会差)。
+        注意:深度计算已移至 processing.stereo_depth.StereoDepthSolver,
+        这里只负责校正(remap),不负责 SGBM 或深度公式。
         """
         return self._calibrator.rectify(img_l, img_r)
-
-    def _compute_depth(self, img_l: np.ndarray, img_r: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """SGBM 算深度。**输入必须是已校正图**(由 :meth:`_apply_rectify` 给出)。"""
-        gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
-        gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
-
-        # 缩放到 SGBM 计算分辨率(小分辨率匹配更准、速度更快)
-        gray_l = cv2.resize(gray_l, (self._sgbm_width, self._sgbm_height))
-        gray_r = cv2.resize(gray_r, (self._sgbm_width, self._sgbm_height))
-
-        disp = self._stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
-
-        # 用真实标定值计算深度
-        with np.errstate(divide="ignore", invalid="ignore"):
-            depth_m = (self._focal * self._baseline) / np.where(disp > 0, disp, 1)
-        depth_m = np.clip(depth_m, 0.05, 10.0).astype(np.float32)
-
-        conf = np.clip(disp / 128.0 * 255, 0, 255).astype(np.uint8)
-
-        return depth_m, conf
 
     def read_rectified_pair(self) -> tuple[np.ndarray, np.ndarray] | None:
         """读一帧并返回**已校正**的左右单眼图 (left_rect, right_rect)。
@@ -365,16 +320,6 @@ class USBCamera(StereoCameraBase):
             return None
         img_l_rect, img_r_rect = rect
         return cv2.hconcat([img_l_rect, img_r_rect])
-
-    def read_depth(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return (depth_m, confidence) or None on error.
-
-        内部走已校正路径,SGBM 在校正图上算视差。
-        """
-        rect = self.read_rectified_pair()
-        if rect is None:
-            return None
-        return self._compute_depth(*rect)
 
     def close(self) -> None:
         if self._single_device:

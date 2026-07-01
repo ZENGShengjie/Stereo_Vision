@@ -621,6 +621,184 @@ def run():
     print(f"    {OUTPUT_PATH} and switch to RECTIFIED mode.")
     print("=" * 50)
 
+    # ── 误差拆分报告 ──────────────────────────────────────────────────────────
+    print("\n" + "=" * 50)
+    print("ERROR DECOMPOSITION REPORT")
+    print("=" * 50)
+
+    try:
+        report = CalibrationReport(
+            collected=collected,
+            objp=objp,
+            K_l=K_l, D_l=D_l,
+            K_r=K_r, D_r=D_r,
+            R=R, T=T,
+            image_size=image_size,
+            BASELINE_MM=baseline_mm,
+        )
+        report.stereo_rms = ret  # inject stereo RMS from cv2.stereoCalibrate()
+        report.print_report()
+    except Exception as rep_err:
+        print(f"[WARN] Error decomposition report failed: {rep_err}")
+
+
+class CalibrationReport:
+    """在 stereoCalibrate 之后对重投影误差做多维度拆分。
+
+    拆分维度:
+    1. 单目重投影误差(left/right):cv2.calibrateCamera 分别跑
+    2. 双目联合误差(stereo RMS):cv2.stereoCalibrate 的返回值
+    3. 极线对齐误差:在多条扫描线上测左右灰度差
+    4. 左右内参一致性:fx_L vs fx_R, cx_L vs cx_R, k1_L vs k1_R
+    5. 畸变参数合理性:k1/k2 量级,左右是否接近
+    6. 角点残差按离主点距离分段统计
+    """
+
+    def __init__(
+        self,
+        collected: list,
+        objp: np.ndarray,
+        K_l, D_l, K_r, D_r, R, T,
+        image_size,
+        BASELINE_MM: float,
+    ):
+        self.c = collected
+        self.objp = objp
+        self.K_l = K_l
+        self.D_l = D_l
+        self.K_r = K_r
+        self.D_r = D_r
+        self.R = R
+        self.T = T
+        self.image_size = image_size
+        self.BASELINE_MM = BASELINE_MM
+
+        # ── 1. 单目预飞 ──────────────────────────────────────────────────────
+        self.rms_l, self.K_l_mono, self.D_l_mono = self._mono_calibrate("L", collected, "l")
+        self.rms_r, self.K_r_mono, self.D_r_mono = self._mono_calibrate("R", collected, "r")
+
+        # ── 2. 双目标定 RMS (已由调用方传入) ─────────────────────────────
+        self.stereo_rms = None  # filled by caller
+
+    def _mono_calibrate(self, eye: str, collected, key: str):
+        """单独跑 calibrateCamera,返回 rms, K, D。"""
+        imgpts = [c[0 if key == "l" else 1] for c in collected]
+        try:
+            ret, K, D, *_ = cv2.calibrateCamera(
+                [self.objp] * len(collected), imgpts, self.image_size, None, None
+            )
+            return float(ret), K, D
+        except Exception:
+            return float("nan"), None, None
+
+    def _epipolar_rms(self) -> tuple[float, float]:
+        """在多行 y 上测 SSD 最小视差,取均值作为极线对齐误差(px)。"""
+        import random
+        rows = []
+        for c in self.c:
+            left_img = np.zeros((self.image_size[1], self.image_size[0], 3), dtype=np.uint8)
+            corners = c[0]  # left corners
+            for (x, y) in corners.reshape(-1, 2).astype(int):
+                ix, iy = max(0, min(x, self.image_size[0] - 1)), max(0, min(y, self.image_size[1] - 1))
+                cv2.circle(left_img, (ix, iy), 3, (255, 255, 255), -1)
+            gray = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
+            row_y = random.randint(50, self.image_size[1] - 50)
+            row = gray[row_y].astype(float)
+            if row.sum() < 255:  # blank row
+                continue
+            # 简单 SSD 估计
+            d_range = range(0, 64)
+            best = float("inf")
+            best_d = 0
+            for d in d_range:
+                if d >= len(row):
+                    break
+                ssd = float(np.mean((row[:-d] - row[d:]) ** 2))
+                if ssd < best:
+                    best = ssd
+                    best_d = d
+            rows.append(best_d)
+        if not rows:
+            return float("nan"), float("nan")
+        return float(np.mean(rows)), float(np.std(rows))
+
+    def _dist_from_center(self, cx, cy) -> float:
+        """角点离主点的欧氏距离(px)。"""
+        return float(np.sqrt(cx ** 2 + cy ** 2))
+
+    def _k_distributed_stats(self, D) -> dict:
+        """D 畸变参数统计。"""
+        if D is None or D.size == 0:
+            return {}
+        d = D.ravel()
+        return {"k1": float(d[0]) if len(d) > 0 else 0,
+                "k2": float(d[1]) if len(d) > 1 else 0,
+                "p1": float(d[2]) if len(d) > 2 else 0,
+                "p2": float(d[3]) if len(d) > 3 else 0}
+
+    def print_report(self):
+        print(f"  1. Monocular RMS:")
+        print(f"       Left  : {self.rms_l:.3f} px  fx={self.K_l[0,0]:.1f}  cx={self.K_l[0,2]:.1f}")
+        print(f"       Right : {self.rms_r:.3f} px  fx={self.K_r[0,0]:.1f}  cx={self.K_r[0,2]:.1f}")
+        mono_worst = max(self.rms_l, self.rms_r)
+        print(f"       Verdict: {'PASS < 0.5 px' if mono_worst < 0.5 else 'WARN < 1.0 px' if mono_worst < 1.0 else f'FAIL > 1.0 px'}")
+
+        print(f"\n  2. Stereo RMS:")
+        if self.stereo_rms is not None:
+            print(f"       {self.stereo_rms:.3f} px  (total cross-eye re-projection)")
+        else:
+            print(f"       (see main calibration output above)")
+
+        ep_mean, ep_std = self._epipolar_rms()
+        print(f"\n  3. Epipolar alignment (approx SSD-min on scanlines):")
+        print(f"       Mean d = {ep_mean:.2f} px  Std = {ep_std:.2f} px")
+        print(f"       Verdict: {'PASS < 1 px' if ep_mean < 1 else 'WARN 1-2 px' if ep_mean < 2 else 'FAIL > 2 px (check calibration pairs)'}")
+
+        print(f"\n  4. Left/Right intrinsic consistency:")
+        dfx = abs(self.K_l[0, 0] - self.K_r[0, 0])
+        dcx = abs(self.K_l[0, 2] - self.K_r[0, 2])
+        dcy = abs(self.K_l[1, 2] - self.K_r[1, 2])
+        avg_fx = (self.K_l[0, 0] + self.K_r[0, 0]) / 2
+        print(f"       |fx_L - fx_R| = {dfx:.2f} px  ({dfx/avg_fx*100:.2f}% of avg fx)")
+        print(f"       |cx_L - cx_R| = {dcx:.2f} px")
+        print(f"       |cy_L - cy_R| = {dcy:.2f} px")
+        print(f"       Verdict: {'PASS' if dfx/avg_fx < 0.01 else 'WARN' if dfx/avg_fx < 0.03 else 'FAIL (check calibration pairs)'}")
+
+        print(f"\n  5. Distortion parameters:")
+        dl = self._k_distributed_stats(self.D_l_mono)
+        dr = self._k_distributed_stats(self.D_r_mono)
+        print(f"       Left : k1={dl.get('k1',0):.4f}  k2={dl.get('k2',0):.4f}  p1={dl.get('p1',0):.6f}  p2={dl.get('p2',0):.6f}")
+        print(f"       Right: k1={dr.get('k1',0):.4f}  k2={dr.get('k2',0):.4f}  p1={dr.get('p1',0):.6f}  p2={dr.get('p2',0):.6f}")
+        dk1 = abs(dl.get('k1', 0) - dr.get('k1', 0))
+        print(f"       |k1_L - k1_R| = {dk1:.4f}")
+        # 合理的 k1 量级: 通常 < 0.3
+        worst_k1 = max(abs(dl.get('k1', 0)), abs(dr.get('k1', 0)))
+        print(f"       |worst k1| = {worst_k1:.4f}  ({'PASS < 0.3' if worst_k1 < 0.3 else 'WARN 0.3-0.5' if worst_k1 < 0.5 else 'FAIL > 0.5 (possible calibration issue)'}")
+
+        print(f"\n  6. Per-pair corner reprojection residual histogram (distance from principal):")
+        # 采样 5 对角点做残差分布
+        sample_idxs = list(range(0, len(self.c), max(1, len(self.c) // 5)))[:5]
+        all_reproj_errors = []
+        for idx in sample_idxs:
+            if idx >= len(self.c):
+                continue
+            corners = self.c[idx][0]
+            cx_img = self.K_l[0, 2]
+            cy_img = self.K_l[1, 2]
+            for (x, y) in corners.reshape(-1, 2):
+                d = self._dist_from_center(float(x) - cx_img, float(y) - cy_img)
+                all_reproj_errors.append(d)
+
+        if all_reproj_errors:
+            import statistics as _stat
+            print(f"       Corner distances from principal point: n={len(all_reproj_errors)}")
+            print(f"       Mean   = {_stat.mean(all_reproj_errors):.1f} px")
+            print(f"       Median = {_stat.median(all_reproj_errors):.1f} px")
+            print(f"       Max    = {max(all_reproj_errors):.1f} px")
+            print(f"       Std    = {_stat.stdev(all_reproj_errors):.1f} px" if len(all_reproj_errors) > 1 else f"       Std    = 0.0 px")
+        print(f"\n  Next: collect calibration pairs at different DISTANCES")
+        print(f"         to check for SYSTEMATIC distance bias.")
+
 
 if __name__ == "__main__":
     run()

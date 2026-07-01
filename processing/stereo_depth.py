@@ -22,6 +22,7 @@ import logging
 import os
 import time
 from collections import deque
+from threading import Lock
 from typing import Optional
 
 import cv2
@@ -136,6 +137,11 @@ class StereoDepthSolver:
         # 最近一次未校正的深度原始值 (用于校准时获取真实传感器读数)
         self._last_raw_depth_cm: Optional[float] = None
 
+        # 状态锁:保护 EMA/校准状态,防止并发写入
+        # 当前 pipeline 只有主线程访问,但 MJPEG handler 在 aiohttp 线程池里
+        # 读 stats_summary() 时可能与 process_one_frame() 并发
+        self._state_lock = Lock()
+
         # #region agent log — H4: 验证 self._focal_px vs compute_focal_px() 实时值
         _debug_log(
             "processing/stereo_depth.py:__init__",
@@ -186,15 +192,24 @@ class StereoDepthSolver:
             pass
         return info
 
-    def compute(self, left_rect: np.ndarray, right_rect: np.ndarray) -> np.ndarray:
+    def compute(
+        self,
+        left_rect: np.ndarray,
+        right_rect: np.ndarray,
+        roi_mask: np.ndarray | None = None,
+    ) -> np.ndarray:
         """对已校正左右图算 SGBM 视差,返回 mono 分辨率(1920x1080)的视差图。
 
         Args:
             left_rect, right_rect: 已校正 BGR 图,``(MONO_HEIGHT, MONO_WIDTH, 3)``。
 
-        Returns:
+            Returns:
             ``disp_at_mono``: 视差图(浮点,像素),``(MONO_HEIGHT, MONO_WIDTH)``。
             无效点 = 0。
+
+            roi_mask: 可选 ROI mask ``(MONO_HEIGHT, MONO_WIDTH)``,255=感兴趣区域。
+                若提供,SGBM 只在 ROI 内搜索(ROI 外填均匀灰抑制错误匹配)。
+                未提供时退化为整图 SGBM(向后兼容)。
 
         Notes:
             - SGBM 输出是 16 倍定点,这里除以 16 折回像素。
@@ -221,7 +236,17 @@ class StereoDepthSolver:
             scale = np.clip(scale, 0.6, 1.8)
             gray_r = np.clip(gray_r * scale, 0, 255).astype(np.uint8)
 
-        # 等比例缩放到 SGBM 分辨率(见 §0 resize 硬约束)
+        # 3. ROI 预处理:在原分辨率上把非 ROI 区域填均匀灰 → resize → SGBM
+        #    这样做的好处:ROI 外填均值后 resize 仍然均匀,SGBM 在 ROI 外不产生有效匹配
+        if roi_mask is not None:
+            roi_l_valid = (roi_mask > 127)
+            roi_r_valid = (roi_mask > 127)
+            roi_mean_l = float(gray_l[roi_l_valid].mean()) if roi_l_valid.any() else 128.0
+            roi_mean_r = float(gray_r[roi_r_valid].mean()) if roi_r_valid.any() else 128.0
+            gray_l = np.where(roi_l_valid, gray_l, int(roi_mean_l)).astype(np.uint8)
+            gray_r = np.where(roi_r_valid, gray_r, int(roi_mean_r)).astype(np.uint8)
+
+        # 等比例缩放到 SGBM 分辨率
         gray_l_sgbm, scale = resize_for_sgbm(gray_l)
         gray_r_sgbm, _ = resize_for_sgbm(gray_r)
 
@@ -253,17 +278,18 @@ class StereoDepthSolver:
         disp_at_mono = np.where(disp_at_mono > 0, disp_at_mono, 0.0).astype(np.float32)
 
         # ── 匹配置信度:视差有效像素比例 × 视差值分布一致性 ────────────────
-        valid = disp_at_mono > 0
-        valid_ratio = valid.sum() / float(disp_at_mono.size)
-        if valid_ratio > 0.01:
-            valid_disp = disp_at_mono[valid]
-            # 变异系数(CV): 分布越集中(标准差/均值越小) → 置信度越高
-            cv = float(valid_disp.std() / (valid_disp.mean() + 1e-6))
-            self._match_confidence = round(float(np.clip(valid_ratio * (1.0 - cv), 0.0, 1.0)), 3)
-        else:
-            self._match_confidence = 0.0
+        with self._state_lock:
+            valid = disp_at_mono > 0
+            valid_ratio = valid.sum() / float(disp_at_mono.size)
+            if valid_ratio > 0.01:
+                valid_disp = disp_at_mono[valid]
+                cv = float(valid_disp.std() / (valid_disp.mean() + 1e-6))
+                self._match_confidence = round(float(np.clip(valid_ratio * (1.0 - cv), 0.0, 1.0)), 3)
+            else:
+                self._match_confidence = 0.0
 
-        self._last_disp_at_mono = disp_at_mono
+        with self._state_lock:
+            self._last_disp_at_mono = disp_at_mono
         return disp_at_mono
 
     def read_depth_at(
@@ -419,7 +445,8 @@ class StereoDepthSolver:
                 z_final = z_vals
 
         d_median = float(np.median(valid_d_in_range))
-        self._last_d_median = d_median
+        with self._state_lock:
+            self._last_d_median = d_median
         result = round(float(np.median(z_final)), 1)
         _debug_log(
             "processing/stereo_depth.py:read_depth_in_box",
@@ -459,28 +486,30 @@ class StereoDepthSolver:
         MIN_CONF_FOR_UPDATE = 0.10  # 置信度低于此值则跳过更新
 
         if current_depth_cm is None:
-            self._last_raw_depth_cm = None
-            return round(self._ema_value, 1) if self._ema_value is not None else None
+            with self._state_lock:
+                self._last_raw_depth_cm = None
+                return round(self._ema_value, 1) if self._ema_value is not None else None
 
         incoming = float(current_depth_cm)
-        conf = max(MIN_CONF_FOR_UPDATE, self._match_confidence)
+        with self._state_lock:
+            conf = max(MIN_CONF_FOR_UPDATE, self._match_confidence)
 
-        # EMA alpha 由置信度动态决定
-        alpha = max(MIN_ALPHA, BASE_ALPHA * conf)
+            alpha = max(MIN_ALPHA, BASE_ALPHA * conf)
 
-        if self._ema_value is None:
-            self._ema_value = incoming
-            self._ema_confidence = conf
-        else:
-            self._ema_value = (
-                alpha * incoming + (1.0 - alpha) * self._ema_value
-            )
-            self._ema_confidence = (
-                alpha * conf + (1.0 - alpha) * self._ema_confidence
-            )
+            if self._ema_value is None:
+                self._ema_value = incoming
+                self._ema_confidence = conf
+            else:
+                self._ema_value = (
+                    alpha * incoming + (1.0 - alpha) * self._ema_value
+                )
+                self._ema_confidence = (
+                    alpha * conf + (1.0 - alpha) * self._ema_confidence
+                )
 
-        raw_result = round(self._ema_value, 1)
-        self._last_raw_depth_cm = raw_result
+            raw_result = round(self._ema_value, 1)
+            self._last_raw_depth_cm = raw_result
+
         # 分段线性插值校正(内置 4 个校准点)
         if len(self._calib_points) >= 2:
             return round(self._interpolate(raw_result), 1)
@@ -589,6 +618,12 @@ class StereoDepthSolver:
             "CALIB",
         )
         return self._calib_points
+
+    @property
+    def calib_points(self) -> list[tuple[float, float]]:
+        """线程安全读取校准点列表。"""
+        with self._state_lock:
+            return list(self._calib_points)
 
 
 __all__ = ["StereoDepthSolver"]
