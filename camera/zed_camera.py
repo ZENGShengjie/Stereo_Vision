@@ -109,6 +109,18 @@ class ZEDCamera(StereoCameraBase):
 
     def read_stereo(self) -> np.ndarray | None:
         """Return stereo BGR image (left+right concatenated) or None on error."""
+        pair = self.read_rectified_pair()
+        if pair is None:
+            return None
+        left, right = pair
+        return self._resize_if_needed(cv2.hconcat([left, right]))
+
+    def read_rectified_pair(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return (left_rect, right_rect) BGR images, or None on error.
+
+        ZED cameras do internal rectification (ZED SDK's rectification),
+        so the raw LEFT/RIGHT views are already aligned for the SBSPipeline.
+        """
         if not self.grab():
             return None
 
@@ -120,9 +132,7 @@ class ZEDCamera(StereoCameraBase):
 
         left = cv2.cvtColor(left_bgra, cv2.COLOR_BGRA2BGR)
         right = cv2.cvtColor(right_bgra, cv2.COLOR_BGRA2BGR)
-
-        stereo = cv2.hconcat([left, right])
-        return self._resize_if_needed(stereo)
+        return left, right
 
     def read_depth(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Return (depth_m, confidence) in millimetres, or None on error.

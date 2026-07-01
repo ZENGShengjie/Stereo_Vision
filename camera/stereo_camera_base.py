@@ -23,8 +23,8 @@ class StereoCameraBase(ABC):
         ...
 
     @abstractmethod
-    def read_depth(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """Return (depth_m, confidence) or None on error."""
+    def read_rectified_pair(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return rectified (left, right) pair or None on error."""
         ...
 
     @abstractmethod
