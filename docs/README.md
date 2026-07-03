@@ -247,8 +247,8 @@ AMCap 通过 DirectShow 能访问双 pin，但 OpenCV 默认只抓第一个 pin�
 | 路径 | 说明 |
 |------|------|
 | `/` | 首页入口 |
+| `/hud` | 视频 + 顶部 HUD 控制面板（实时调参，推荐） |
 | `/stereo?transport=webrtc` | WebRTC 低延迟双目（推荐，需 TURN 服务器） |
-| `/stereo?transport=http` | MJPEG HTTP 调试 |
 | `/depth` | 深度可视化（彩色深度图 + 统计数据） |
 | `/control` | 显示参数控制台（裁切/畸变/分隔线） |
 | `/debug` | 调试：FPS + 原始帧 |
