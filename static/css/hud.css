@@ -1,0 +1,182 @@
+/* HUD view (2026-07-04): on-video control panel + readouts */
+
+.hud-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  background: rgba(20, 20, 20, 0.92);
+  border-bottom: 1px solid #333;
+  padding: 8px 12px 8px 8px;
+  position: relative;
+  z-index: 10;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  font-size: 13px;
+  color: #ddd;
+  gap: 18px;
+}
+
+.hud-bar.hidden { display: none; }
+
+.hud-section {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.hud-readouts { flex: 0 1 auto; }
+
+.hud-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 4px 10px;
+  background: #181818;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  min-width: 70px;
+}
+.hud-stat .lbl {
+  color: #888;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.hud-stat .val {
+  color: #6cf;
+  font-weight: bold;
+  font-variant-numeric: tabular-nums;
+}
+.hud-stat .unit { color: #888; font-size: 11px; margin-left: 1px; }
+
+/* Quality badge (high/medium/low) */
+.hud-stat .badge {
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: bold;
+  margin-left: 4px;
+}
+.hud-stat .badge.high   { background: #1a472a; color: #4f8; }
+.hud-stat .badge.medium { background: #4a3d1a; color: #fc4; }
+.hud-stat .badge.low    { background: #4a1a1a; color: #f55; }
+
+/* Controls: 标签 + 输入框 + SET 按钮 */
+.hud-controls { flex: 1 1 auto; flex-wrap: wrap; }
+
+.hud-ctrl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #161616;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.hud-ctrl .lbl { color: #888; }
+.hud-ctrl input {
+  width: 64px;
+  background: #0c0c0c;
+  color: #6cf;
+  border: 1px solid #333;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-family: monospace;
+  font-variant-numeric: tabular-nums;
+}
+.hud-ctrl input:focus { outline: none; border-color: #6cf; }
+
+/* SET/RESET 按钮 */
+.btn-set, .hud-quick button {
+  background: #1c2734;
+  color: #6cf;
+  border: 1px solid #2c4a6e;
+  border-radius: 3px;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+.btn-set:hover, .hud-quick button:hover { background: #244066; }
+.btn-set:active { transform: translateY(1px); }
+.btn-set.success { background: #1a472a; color: #4f8; }
+.btn-set.error   { background: #4a1a1a; color: #f55; }
+
+.hud-quick {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+}
+.hud-quick input {
+  width: 56px;
+  background: #0c0c0c;
+  color: #6cf;
+  border: 1px solid #333;
+  border-radius: 3px;
+  padding: 2px 4px;
+  font-family: monospace;
+}
+
+/* 右上角 [ - ] 开关 */
+.hud-toggle-btn {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  background: transparent;
+  color: #888;
+  border: 1px solid #333;
+  border-radius: 4px;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  font-family: monospace;
+  font-size: 14px;
+  font-weight: bold;
+}
+.hud-toggle-btn:hover { color: #6cf; border-color: #6cf; }
+
+/* 视频区域: 撑满剩余空间 */
+.hud-video-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #000;
+  height: calc(100vh - 90px);  /* 减去 HUD bar + footer 高度 */
+  overflow: hidden;
+}
+.hud-video-wrap img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* HUD 隐藏后视频铺满 */
+.hud-bar.hidden + .hud-video-wrap {
+  height: calc(100vh - 38px);
+}
+
+/* 底部状态条: 错误或成功提示 */
+.hud-foot {
+  position: fixed;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(20, 20, 20, 0.92);
+  color: #ddd;
+  padding: 6px 14px;
+  border-radius: 4px;
+  border: 1px solid #333;
+  font-family: monospace;
+  font-size: 12px;
+  opacity: 0;
+  transition: opacity 0.3s;
+  z-index: 20;
+  pointer-events: none;
+}
+.hud-foot.show { opacity: 1; }
+.hud-foot.success { border-color: #4f8; color: #4f8; }
+.hud-foot.error   { border-color: #f55; color: #f55; }

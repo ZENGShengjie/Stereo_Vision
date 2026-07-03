@@ -55,6 +55,13 @@ async def perf_page(request: web.Request) -> web.Response:
     return web.Response(text=template.render(), content_type="text/html")
 
 
+async def hud_page(request: web.Request) -> web.Response:
+    """2026-07-04: HUD page = video feed + on-video control panel."""
+    jinja = _build_jinja(request.app)
+    template = jinja.get_template("hud.html")
+    return web.Response(text=template.render(), content_type="text/html")
+
+
 def register_page_routes(app: web.Application) -> None:
     app.router.add_get("/", home_page)
     app.router.add_get("/stereo", stereo_page)
@@ -62,3 +69,4 @@ def register_page_routes(app: web.Application) -> None:
     app.router.add_get("/control", control_page)
     app.router.add_get("/debug", debug_page)
     app.router.add_get("/perf", perf_page)
+    app.router.add_get("/hud", hud_page)

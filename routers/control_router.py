@@ -4,6 +4,11 @@ from aiohttp import web
 
 from config import CAMERA_TYPE
 from services import control_service
+from state import PIPELINE_KEY
+
+
+# App-state key used by the on-video HUD (2026-07-04).
+_HUD_KEY = "hud_visible"
 
 
 async def get_params_handler(_request: web.Request) -> web.Response:
@@ -165,6 +170,54 @@ def register_control_routes(app: web.Application) -> None:
     app.router.add_get("/api/calibrate/disp_scale", get_disp_scale_handler)
     app.router.add_post("/api/calibrate/disp_scale", calibrate_disp_scale_handler)
     app.router.add_post("/api/calibrate/depth_ratio", calibrate_depth_ratio_handler)
+    # HUD state (2026-07-04): single endpoint feeds the on-video control panel
+    app.router.add_get("/api/hud/state", get_hud_state_handler)
+    app.router.add_post("/api/hud/toggle", hud_toggle_handler)
+
+
+async def get_hud_state_handler(request: web.Request) -> web.Response:
+    """GET /api/hud/state — one-shot snapshot for the on-video control panel.
+
+    Pulls pipeline ``stats_summary()`` + hardware ``list_overrides()`` into a
+    single JSON so the HUD only needs one fetch per polling tick.
+    """
+    import config.hardware as hw
+    pipeline = request.app.get(PIPELINE_KEY)
+    base = {
+        "visibility": request.app.get(_HUD_KEY, True),
+        "pipeline_available": pipeline is not None,
+    }
+    if pipeline is None:
+        return web.json_response({**base, "error": "pipeline not available"})
+    try:
+        stats = pipeline.stats_summary()
+    except Exception as ex:  # noqa: BLE001
+        return web.json_response({**base, "error": f"stats failed: {ex}"})
+    stats.update(base)
+    stats["hardware_overrides"] = hw.list_overrides()
+    return web.json_response(stats)
+
+
+async def hud_toggle_handler(request: web.Request) -> web.Response:
+    """POST /api/hud/toggle — flip HUD visibility (server-side default).
+
+    Body: ``{"visible": true|false}`` (omit to toggle current state).
+
+    Falls back gracefully if no pipeline is attached (default is ``True``).
+    """
+    body = None
+    if request.body_exists:
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+    cur = bool(request.app.get(_HUD_KEY, True))
+    if isinstance(body, dict) and "visible" in body:
+        new_val = bool(body["visible"])
+    else:
+        new_val = not cur
+    request.app[_HUD_KEY] = new_val
+    return web.json_response({"visible": new_val})
 
 
 async def get_hardware_overrides_handler(_request: web.Request) -> web.Response:
