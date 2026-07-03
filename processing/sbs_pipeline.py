@@ -266,17 +266,21 @@ class SBSPipeline:
         #    有 box → 在 box 周围做 ROI-裁剪 + ROI-SGBM,效率高、噪声小
         #    无 box → 退化到整图 SGBM(向后兼容)
         t4 = time.perf_counter()
+        depth_status = "no_target"   # 2026-07-03: 显式状态机
         try:
             if box_l is not None or box_r is not None:
                 disp = self._solver.compute_roi(left, right, box_l=box_l, box_r=box_r)
+                depth_status = "valid_disparity_no_depth"  # 有视差但还没算深度
             else:
                 roi_mask = self._build_roi_mask(box_l, box_r)
                 disp = self._solver.compute(left, right, roi_mask=roi_mask)
+                depth_status = "full_image_fallback"
             # 保存本帧视差给下一帧用(视差辅助选最近)
             self._last_disp = disp
         except Exception as ex:  # noqa: BLE001
             logger.warning("[SBSPipeline] solver.compute failed: %s", ex)
             disp = None
+            depth_status = "sgbm_error"
         t5 = time.perf_counter()
         t_sgbm = t5 - t4
 
@@ -284,12 +288,21 @@ class SBSPipeline:
         #    左右眼各算一次取平均:视差几何上左右眼是对称的,各算一次能消除单眼 SGBM 漏匹配。
         #    这里用左右眼各自的 box,因为左右眼的 cup 位置/大小不完全一致。
         t6 = time.perf_counter()
-        if disp is not None:
+        # 2026-07-03: 统一异常处理 — 无有效目标框 / 视差失效 / 深度无效
+        # 都返回 depth_cm=None + 显式 depth_status,不再走 read_depth_at 单点采样
+        if disp is not None and (box_l is not None or box_r is not None):
             depth_l = self._solver.read_depth_in_box(box_l, disp=disp) if box_l is not None else None
             depth_r = self._solver.read_depth_in_box(box_r, disp=disp) if box_r is not None else None
             d_raw = _fuse_depths([depth_l, depth_r])
             if d_raw is not None:
                 depth_cm = self._solver.smoothed_depth(d_raw)
+                depth_status = "ok"
+            else:
+                depth_status = "no_valid_depth_in_box"
+        elif disp is None:
+            depth_status = depth_status  # 已是 sgbm_error / no_target
+        else:
+            depth_status = "no_target_box"
         t7 = time.perf_counter()
         t_depth = t7 - t6
 
@@ -341,6 +354,7 @@ class SBSPipeline:
                 "t_total_ms": round(total_ms, 1),
                 "fps_approx": round(1000.0 / total_ms, 1) if total_ms > 0 else 0,
                 "depth_cm": depth_cm,
+                "depth_status": depth_status,
                 "box_l": list(box_l) if box_l is not None else None,
                 "box_r": list(box_r) if box_r is not None else None,
                 "frame": self._frames,
@@ -366,6 +380,7 @@ class SBSPipeline:
             "depth_ms": round(t_depth * 1000, 1),
             "render_ms": round(t_render * 1000, 1),
             "depth_cm": depth_cm,
+            "depth_status": depth_status,
             "match_confidence": match_conf,
             "fps_approx": round(1000.0 / total_ms, 1) if total_ms > 0 else 0,
             "d_median": d_median,
@@ -417,9 +432,9 @@ class SBSPipeline:
             idx = max(0, int(len(arr) * p / 100) - 1)
             return round(arr[idx], 1)
 
-        from config.hardware import compute_focal_px as _fp, BASELINE_CM as _b
+        from config.hardware import compute_focal_px as _fp, get_hw as _hw
         fp = float(_fp())
-        b  = float(_b)
+        b  = float(_hw("BASELINE_CM"))
 
         # Last depth record with raw (un-calibrated) sensor reading
         last = ring[-1]
@@ -449,6 +464,12 @@ class SBSPipeline:
         for r in ring:
             path_counts[r.get("sgbm_path", "error")] = path_counts.get(r.get("sgbm_path", "error"), 0) + 1
 
+        # depth_status 统计 (2026-07-03: 统一异常状态机)
+        status_counts: dict[str, int] = {}
+        for r in ring:
+            s = r.get("depth_status", "unknown")
+            status_counts[s] = status_counts.get(s, 0) + 1
+
         return {
             "fps": round(fps, 1),
             "latency_p50_ms": pct(totals_sorted, 50),
@@ -465,6 +486,8 @@ class SBSPipeline:
                 "render_ms": round(sum(r["render_ms"] for r in ring) / n, 1),
             },
             "depth_cm": last.get("depth_cm"),
+            "depth_status": last.get("depth_status", "unknown"),
+            "depth_status_counts": status_counts,
             "d_median_px": d_med,
             "z_measured_cm": z_raw,
             "match_confidence": conf,

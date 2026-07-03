@@ -160,9 +160,58 @@ def register_control_routes(app: web.Application) -> None:
     app.router.add_post("/api/params", update_params_handler)
     app.router.add_post("/api/params/reset", reset_params_handler)
     app.router.add_get("/api/status", status_handler)
+    app.router.add_get("/api/calibrate/hardware", get_hardware_overrides_handler)
+    app.router.add_post("/api/calibrate/hardware", set_hardware_overrides_handler)
     app.router.add_get("/api/calibrate/disp_scale", get_disp_scale_handler)
     app.router.add_post("/api/calibrate/disp_scale", calibrate_disp_scale_handler)
     app.router.add_post("/api/calibrate/depth_ratio", calibrate_depth_ratio_handler)
+
+
+async def get_hardware_overrides_handler(_request: web.Request) -> web.Response:
+    """GET /api/calibrate/hardware — read all live tunable hardware parameters.
+
+    Returns ``{key: {current, default, unit, desc, is_overridden}}`` for every
+    key in the schema (always includes both live + default values so the UI
+    can show a comparison table).
+    """
+    import config.hardware as hw
+    return web.json_response(hw.list_overrides())
+
+
+async def set_hardware_overrides_handler(request: web.Request) -> web.Response:
+    """POST /api/calibrate/hardware — update one or more parameters atomically.
+
+    Body example:
+        {"BASELINE_CM": 6.0, "HFOV_DEG": 78.5, "SGBM_NUM_DISPARITIES": 256}
+
+    - Each key validated against :data:`config.hardware._HW_SCHEMA` (range + type).
+    - SGBM_NUM_DISPARITIES must be a multiple of 16.
+    - SGBM_BLOCK_SIZE must be odd.
+    - All-or-nothing: if any value fails validation, no overrides are written.
+    - On success: writes to data/hardware_overrides.json + audit log.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+    if not isinstance(data, dict) or not data:
+        return web.json_response(
+            {"error": "body must be a non-empty JSON object"}, status=400
+        )
+
+    import config.hardware as hw
+    try:
+        # Two-phase: validate everything first, then apply. Atomicity guarantee.
+        prepared = {k: hw.set_hw(k, v, source="api/calibrate/hardware") for k, v in data.items()}
+    except (KeyError, ValueError) as ex:
+        return web.json_response(
+            {"error": str(ex)}, status=400
+        )
+    return web.json_response({
+        "status": "ok",
+        "applied": prepared,
+        "all_overrides": hw.list_overrides(),
+    })
 
 
 async def get_disp_scale_handler(_request: web.Request) -> web.Response:

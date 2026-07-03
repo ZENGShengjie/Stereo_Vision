@@ -281,10 +281,14 @@ def compute_focal_px() -> float:
 
     这样不需要在 npz 里假定 Q 矩阵,也能给出一致的像素焦距。
 
+    HFOV_DEG 在 2026-07-03 起走动态层:运行时 ``POST /api/calibrate/hardware``
+    修改后,下一帧调用本函数就拿到新值。
+
     Returns:
         像素焦距(浮点)。
     """
-    hfov_rad = math.radians(HFOV_DEG)
+    hfov_deg = float(get_hw("HFOV_DEG"))
+    hfov_rad = math.radians(hfov_deg)
     return MONO_WIDTH / (2.0 * math.tan(hfov_rad / 2.0))
 
 
@@ -299,7 +303,9 @@ def z_cm_from_disparity(disp: float) -> float:
       (3mm + 80° → ~1144 px),这是真实双目三角测距公式
     - ``d`` —— SGBM 输出的像素视差
     - ``DISP_SCALE`` —— 校准系数,见 :data:`DISP_SCALE` 说明,默认 4.0
-      实际值通过 :func:`get_disp_scale` 实时读取(支持热更新)
+      实际值通过 :func:`get_hw` 实时读取(支持热更新)
+    - ``BASELINE_CM`` —— 双目基线,2026-07-03 起也走动态层
+      (调 ``POST /api/calibrate/hardware`` 可在线改,例如从 6.0 → 5.8 补偿标定误差)
 
     **历史**:原公式 ``Z_cm = (FOCAL_LENGTH_MM * BASELINE_CM * 10) / d / 10``
     = ``18 / d`` 仅用物理焦距 3mm 不带像素焦距,与真实物理 cm 有 ~4 倍尺度差。
@@ -317,59 +323,104 @@ def z_cm_from_disparity(disp: float) -> float:
     if disp <= 0:
         raise ValueError(f"disp must be > 0, got {disp}")
     f_px = compute_focal_px()
-    return (f_px * BASELINE_CM) / (disp * get_disp_scale())
+    baseline = float(get_hw("BASELINE_CM"))
+    return (f_px * baseline) / (disp * float(get_hw("DISP_SCALE")))
 
 
 # ---------------------------------------------------------------------------
 # Public API for runtime-tunable hardware parameters (2026-07-03)
 # ---------------------------------------------------------------------------
-def get_disp_scale() -> float:
-    """Read the live DISP_SCALE (override → build-time default).
+# Supported keys + validation rules. Adding a new tunable parameter only
+# requires adding an entry here + an associated module constant; callers
+# should use :func:`get_hw` instead of importing the constant.
+_HW_SCHEMA: dict[str, dict] = {
+    "DISP_SCALE":          {"type": float, "min": 0.001, "max": 100.0, "default": float(DISP_SCALE),         "unit": "ratio",    "desc": "SGBM disparity → physical cm scale"},
+    "BASELINE_CM":         {"type": float, "min": 0.5,   "max": 50.0,  "default": float(BASELINE_CM),        "unit": "cm",       "desc": "Stereo baseline (physical distance between cameras)"},
+    "HFOV_DEG":            {"type": float, "min": 20.0,  "max": 150.0, "default": float(HFOV_DEG),           "unit": "deg",      "desc": "Horizontal FOV; used to derive focal_px via tan(HFOV/2)"},
+    "SGBM_NUM_DISPARITIES":{"type": int,   "min": 16,    "max": 512,   "default": int(SGBM_NUM_DISPARITIES), "unit": "px (×16)", "desc": "SGBM disparity search range (must be multiple of 16)"},
+    "SGBM_BLOCK_SIZE":     {"type": int,   "min": 1,     "max": 21,    "default": int(SGBM_BLOCK_SIZE),      "unit": "px",       "desc": "SGBM matching block size (odd, 1-21)"},
+}
 
-    Always call this instead of importing the constant directly when computing
-    depth. Reading the constant via ``from config.hardware import DISP_SCALE``
-    captures the import-time value, which means a runtime ``POST /api/calibrate
-    /disp_scale`` would not be visible to the depth formula.
+
+def get_hw(key: str):
+    """Generic getter for any tunable hardware parameter.
+
+    Returns the live override if set, else the build-time default.
+    Raises ``KeyError`` for unknown keys.
     """
+    if key not in _HW_SCHEMA:
+        raise KeyError(f"Unknown hardware key '{key}'. Known: {sorted(_HW_SCHEMA)}")
     with _OVERRIDES_LOCK:
-        v = _OVERRIDES.get("DISP_SCALE")
-    if v is not None and v > 0:
-        return float(v)
-    return float(DISP_SCALE)
+        v = _OVERRIDES.get(key)
+    if v is not None:
+        return _HW_SCHEMA[key]["type"](v)
+    return _HW_SCHEMA[key]["default"]
 
 
-def set_disp_scale(new_value: float, *, source: str = "api", extra: dict | None = None) -> dict:
-    """Update DISP_SCALE in memory, persist to disk, and append an audit line.
+def set_hw(key: str, new_value, *, source: str = "api", extra: dict | None = None) -> dict:
+    """Generic setter with validation, persistence, and audit.
 
-    Args:
-        new_value: New scale (must be > 0 and <= 100; sanity bound).
-        source: Short tag for the audit log (e.g. ``"api"`` or ``"cli"``).
-        extra: Optional metadata to attach to the audit log entry.
-
-    Returns:
-        ``{"old": float, "new": float, "persisted": bool}``
+    Returns ``{"key", "old", "new", "persisted", "applied_now"}``. For most
+    keys ``applied_now=True`` (next frame uses the new value). For SGBM
+    parameters, the next call to :class:`StereoDepthSolver.compute` /
+    :meth:`compute_roi` will rebuild the matcher with the new settings.
 
     Raises:
-        ValueError: ``new_value`` out of range.
+        KeyError: unknown key.
+        ValueError: value out of range or wrong type.
     """
-    new_value = float(new_value)
-    if not (0.001 <= new_value <= 100.0):
-        raise ValueError(f"DISP_SCALE must be in [0.001, 100], got {new_value}")
+    if key not in _HW_SCHEMA:
+        raise KeyError(f"Unknown hardware key '{key}'. Known: {sorted(_HW_SCHEMA)}")
+    spec = _HW_SCHEMA[key]
+    try:
+        new_value = spec["type"](new_value)
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"{key} must be {spec['type'].__name__}, got {new_value!r}: {ex}")
+    if not (spec["min"] <= new_value <= spec["max"]):
+        raise ValueError(f"{key} must be in [{spec['min']}, {spec['max']}], got {new_value}")
+    if key == "SGBM_NUM_DISPARITIES" and new_value % 16 != 0:
+        raise ValueError(f"SGBM_NUM_DISPARITIES must be a multiple of 16, got {new_value}")
+    if key == "SGBM_BLOCK_SIZE" and new_value % 2 == 0:
+        raise ValueError(f"SGBM_BLOCK_SIZE must be odd, got {new_value}")
+
     with _OVERRIDES_LOCK:
-        old_value = _OVERRIDES.get("DISP_SCALE", float(DISP_SCALE))
-        _OVERRIDES["DISP_SCALE"] = new_value
+        old_value = _OVERRIDES.get(key, spec["default"])
+        _OVERRIDES[key] = new_value
     _persist_overrides()
-    _log_override("DISP_SCALE", old_value, new_value, source, extra)
-    return {"old": old_value, "new": new_value, "persisted": True}
+    _log_override(key, old_value, new_value, source, extra)
+    return {"key": key, "old": old_value, "new": new_value, "persisted": True, "applied_now": True}
 
 
 def list_overrides() -> dict[str, dict]:
-    """Return a snapshot of all live overrides (audit-friendly view)."""
+    """Return all live overrides + the build-time default for each known key.
+
+    Always returns an entry for every key in :data:`_HW_SCHEMA`, so callers can
+    tell at a glance which params are currently overridden vs at default.
+    """
     with _OVERRIDES_LOCK:
-        return {
-            k: {"current": v, "default": float(DISP_SCALE) if k == "DISP_SCALE" else None}
-            for k, v in _OVERRIDES.items()
+        snap = dict(_OVERRIDES)
+    return {
+        k: {
+            "current": float(snap[k]) if k in snap else spec["default"],
+            "default": spec["default"],
+            "unit": spec["unit"],
+            "desc": spec["desc"],
+            "is_overridden": k in snap,
         }
+        for k, spec in _HW_SCHEMA.items()
+    }
+
+
+# Back-compat shims (deprecated; prefer :func:`get_hw` / :func:`set_hw`)
+def get_disp_scale() -> float:
+    """DEPRECATED wrapper for ``get_hw('DISP_SCALE')``."""
+    return float(get_hw("DISP_SCALE"))
+
+
+def set_disp_scale(new_value: float, *, source: str = "api", extra: dict | None = None) -> dict:
+    """DEPRECATED wrapper for ``set_hw('DISP_SCALE', ...)``."""
+    info = set_hw("DISP_SCALE", new_value, source=source, extra=extra)
+    return {"old": info["old"], "new": info["new"], "persisted": info["persisted"]}
 
 
 def resize_for_sgbm(img: np.ndarray) -> tuple[np.ndarray, float]:
@@ -463,7 +514,9 @@ __all__ = [
     "z_cm_from_disparity",
     "resize_for_sgbm",
     "resize_to_mono",
+    "get_hw",
+    "set_hw",
+    "list_overrides",
     "get_disp_scale",
     "set_disp_scale",
-    "list_overrides",
 ]

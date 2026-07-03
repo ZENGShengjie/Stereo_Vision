@@ -61,14 +61,13 @@ from config.hardware import (
     FOCAL_LENGTH_MM,
     MONO_HEIGHT,
     MONO_WIDTH,
-    SGBM_BLOCK_SIZE,
     SGBM_HEIGHT,
     SGBM_MEDIAN_KSIZE,
-    SGBM_NUM_DISPARITIES,
     SGBM_P1_MULT,
     SGBM_P2_MULT,
     SGBM_WIDTH,
     compute_focal_px,
+    get_hw,
     resize_for_sgbm,
     z_cm_from_disparity,
 )
@@ -98,22 +97,12 @@ class StereoDepthSolver:
     """
 
     def __init__(self, window_size: int = DEPTH_SMOOTH_WINDOW) -> None:
-        p1 = SGBM_P1_MULT * 3 * SGBM_BLOCK_SIZE ** 2
-        p2 = SGBM_P2_MULT * 3 * SGBM_BLOCK_SIZE ** 2
-        self._matcher = cv2.StereoSGBM_create(
-            minDisparity=0,
-            numDisparities=SGBM_NUM_DISPARITIES,
-            blockSize=SGBM_BLOCK_SIZE,
-            P1=p1,
-            P2=p2,
-            disp12MaxDiff=1,
-            uniquenessRatio=5,
-            speckleWindowSize=0,
-            speckleRange=0,
-            mode=cv2.STEREO_SGBM_MODE_SGBM,
-        )
+        # 初始 matcher 用当前 SGBM_* 动态值
+        self._matcher_num_disp = -1
+        self._matcher_block_size = -1
+        self._matcher = self._build_matcher()
         self._focal_px = float(compute_focal_px())
-        self._baseline_m = BASELINE_CM / 100.0
+        self._baseline_m = float(get_hw("BASELINE_CM")) / 100.0
         self._window_size = max(1, int(window_size))
         self._last_disp_at_mono: Optional[np.ndarray] = None
         self._last_d_median: Optional[float] = None
@@ -152,9 +141,9 @@ class StereoDepthSolver:
                 "self_focal_px": self._focal_px,
                 "compute_focal_px_now": float(compute_focal_px()),
                 "FOCAL_LENGTH_MM": FOCAL_LENGTH_MM,
-                "BASELINE_CM": BASELINE_CM,
+                "BASELINE_CM": float(get_hw("BASELINE_CM")),
                 "DISP_SCALE": _disp_scale(),
-                "HFOV_DEG_NOT_IMPORTED": True,
+                "HFOV_DEG": float(get_hw("HFOV_DEG")),
                 "opencv_build_info": self._get_opencv_backend_info(),
             },
             "H4",
@@ -164,9 +153,50 @@ class StereoDepthSolver:
         logger.info(
             "[StereoDepthSolver] SGBM: numDisp=%d blockSize=%d p1=%d p2=%d, "
             "smoothing window=%d, focal_px=%.2f",
-            SGBM_NUM_DISPARITIES, SGBM_BLOCK_SIZE, p1, p2,
+            self._matcher_num_disp, self._matcher_block_size,
+            self._p1, self._p2,
             self._window_size, self._focal_px,
         )
+
+    def _build_matcher(self) -> cv2.StereoSGBM:
+        """Build an SGBM matcher from current dynamic SGBM_NUM_DISPARITIES / SGBM_BLOCK_SIZE."""
+        num_disp = int(get_hw("SGBM_NUM_DISPARITIES"))
+        block = int(get_hw("SGBM_BLOCK_SIZE"))
+        self._p1 = SGBM_P1_MULT * 3 * block * block
+        self._p2 = SGBM_P2_MULT * 3 * block * block
+        m = cv2.StereoSGBM_create(
+            minDisparity=0,
+            numDisparities=num_disp,
+            blockSize=block,
+            P1=self._p1,
+            P2=self._p2,
+            disp12MaxDiff=1,
+            uniquenessRatio=5,
+            speckleWindowSize=0,
+            speckleRange=0,
+            mode=cv2.STEREO_SGBM_MODE_SGBM,
+        )
+        self._matcher_num_disp = num_disp
+        self._matcher_block_size = block
+        return m
+
+    def _maybe_rebuild_matcher(self) -> None:
+        """Re-build SGBM matcher if dynamic SGBM_* keys changed since last build."""
+        cur_num = int(get_hw("SGBM_NUM_DISPARITIES"))
+        cur_block = int(get_hw("SGBM_BLOCK_SIZE"))
+        if cur_num != self._matcher_num_disp or cur_block != self._matcher_block_size:
+            _debug_log(
+                "processing/stereo_depth.py:_maybe_rebuild_matcher",
+                "sgbm_matcher_rebuilt",
+                {
+                    "old_num_disp": self._matcher_num_disp,
+                    "new_num_disp": cur_num,
+                    "old_block_size": self._matcher_block_size,
+                    "new_block_size": cur_block,
+                },
+                "PERF",
+            )
+            self._matcher = self._build_matcher()
 
     def _get_opencv_backend_info(self) -> dict:
         """收集 OpenCV 推理后端信息."""
@@ -331,6 +361,9 @@ class StereoDepthSolver:
             },
             "SGBM",
         )
+        # ── SGBM 动态参数(2026-07-03):若 runtime 改了 SGBM_NUM_DISPARITIES /
+        #    SGBM_BLOCK_SIZE,这一行重建 matcher(只读一次 dict,O(1))
+        self._maybe_rebuild_matcher()
         t_sgbm_start = time.perf_counter()
         disp_sgbm_x16 = self._matcher.compute(gray_l_sgbm, gray_r_sgbm)
         t_sgbm_end = time.perf_counter()
@@ -457,13 +490,16 @@ class StereoDepthSolver:
             {
                 "gray_l_sgbm_shape": list(gray_l_sgbm.shape),
                 "scale": round(scale, 4),
-                "numDisparities": SGBM_NUM_DISPARITIES,
-                "blockSize": SGBM_BLOCK_SIZE,
-                "P1": SGBM_P1_MULT * 3 * SGBM_BLOCK_SIZE ** 2,
-                "P2": SGBM_P2_MULT * 3 * SGBM_BLOCK_SIZE ** 2,
+                "numDisparities": int(get_hw("SGBM_NUM_DISPARITIES")),
+                "blockSize": int(get_hw("SGBM_BLOCK_SIZE")),
+                "P1": SGBM_P1_MULT * 3 * int(get_hw("SGBM_BLOCK_SIZE")) ** 2,
+                "P2": SGBM_P2_MULT * 3 * int(get_hw("SGBM_BLOCK_SIZE")) ** 2,
             },
             "SGBM",
         )
+        # ── SGBM 动态参数(2026-07-03):runtime 改了 SGBM_NUM_DISPARITIES /
+        #    SGBM_BLOCK_SIZE 时,下一行重建 matcher
+        self._maybe_rebuild_matcher()
         t_sgbm_start = time.perf_counter()
         # SGBM 在 16 倍定点上输出
         disp_sgbm_x16 = self._matcher.compute(gray_l_sgbm, gray_r_sgbm)
@@ -580,7 +616,7 @@ class StereoDepthSolver:
         valid_d = region[valid_mask]
         f_px = compute_focal_px()
         ds = _disp_scale()
-        z = (f_px * BASELINE_CM) / (valid_d * ds)
+        z = (f_px * float(get_hw("BASELINE_CM"))) / (valid_d * ds)
         in_range = (z >= DEPTH_MIN_CM) & (z <= DEPTH_MAX_CM)
         z_vals = z[in_range]
         valid_d_in_range = valid_d[in_range]
@@ -704,13 +740,13 @@ class StereoDepthSolver:
                 "valid_in_range": len(z_vals),
                 "d_median": d_median,
                 "f_px": f_px,
-                "BASELINE_CM": BASELINE_CM,
+                "BASELINE_CM": float(get_hw("BASELINE_CM")),
                 "DISP_SCALE": ds,
                 "z_peak": float(np.median(z_final)),
                 "z_weighted": result_z,
                 "z_returned": result,
-                "suggested_SCALE_for_realZ_25cm": (f_px * BASELINE_CM) / (25.0 * d_median),
-                "suggested_SCALE_for_realZ_30cm": (f_px * BASELINE_CM) / (30.0 * d_median),
+                "suggested_SCALE_for_realZ_25cm": (f_px * float(get_hw("BASELINE_CM"))) / (25.0 * d_median),
+                "suggested_SCALE_for_realZ_30cm": (f_px * float(get_hw("BASELINE_CM"))) / (30.0 * d_median),
             },
             "JITTER",
         )
@@ -879,12 +915,14 @@ __all__ = ["StereoDepthSolver"]
 
 if __name__ == "__main__":
     # 公式自检:不依赖摄像头
-    print("formula self-check (literal task spec):")
+    print("formula self-check (live values):")
     print(f"  Z_cm(d) = (f_px * BASELINE_CM) / (d * DISP_SCALE)")
-    print(f"  f_px = {compute_focal_px():.2f}, BASELINE_CM = {BASELINE_CM}, "
-          f"DISP_SCALE = {get_disp_scale()} (live; default module const = {DISP_SCALE})")
+    _b = float(get_hw("BASELINE_CM"))
+    _s = float(get_hw("DISP_SCALE"))
+    print(f"  f_px = {compute_focal_px():.2f}, BASELINE_CM = {_b} "
+          f"(default = {BASELINE_CM}), DISP_SCALE = {_s} (default = {DISP_SCALE})")
     for d in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]:
-        z_cm_real = (compute_focal_px() * BASELINE_CM) / (d * get_disp_scale())
+        z_cm_real = (compute_focal_px() * _b) / (d * _s)
         # 反推:如果看到 z_cm_real,需要多少视差
         print(f"  d={d:6.1f} px -> Z_cm = {z_cm_real:7.2f} cm")
     print(f"  DEPTH_SMOOTH_WINDOW={DEPTH_SMOOTH_WINDOW}, "
