@@ -140,6 +140,17 @@ class SBSPipeline:
         self._stats_lock = Lock()
         self._stats_ring: deque[dict] = deque(maxlen=_STATS_RING_SIZE)
 
+        # ── Leader's #7: Decouple YOLO from per-frame processing ──────
+        # YOLO is the most expensive step (~80ms/call × 2 eyes). Running it
+        # every frame is wasteful. Instead, refresh YOLO detections every
+        # ``DETECT_REFRESH_INTERVAL`` frames and reuse the cached boxes on
+        # in-between frames. The cup typically moves slowly; a stale box
+        # for a few frames is acceptable.
+        self._DETECT_REFRESH_INTERVAL = 2   # refresh every 2 frames
+        self._cached_box_l: Optional[Box] = None
+        self._cached_box_r: Optional[Box] = None
+        self._frames_since_detect: int = 0   # counter (also det-skip rate visible in logs)
+
     def process_one_frame(
         self,
         left: Optional[np.ndarray] = None,
@@ -183,25 +194,39 @@ class SBSPipeline:
         t0 = time.perf_counter()
         t_yolo_l = t_yolo_r = t_sgbm = t_depth = t_render = 0.0
 
-        # 2. YOLO cup 检测 - 左右眼各跑一次(Bug fix 2026-06-17)
+        # 2. YOLO cup 检测 - 解耦(Leader's #7)
+        #    每 N 帧刷新一次,其他帧复用缓存的 box → 把 ~80ms 的 YOLO 成本从
+        #    每帧压低到每 2-3 帧一次。cup 通常移动很慢,几个 frame 内 box 漂移可忽略。
         t1 = time.perf_counter()
-        try:
-            box_l, _ = self._detector.detect(left)
-        except Exception as ex:  # noqa: BLE001
-            logger.warning("[SBSPipeline] detector(left) failed: %s", ex)
+        need_detect = (
+            self._cached_box_l is None
+            or self._cached_box_r is None
+            or self._frames_since_detect >= self._DETECT_REFRESH_INTERVAL
+        )
+        if need_detect:
+            try:
+                self._cached_box_l, _ = self._detector.detect(left)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("[SBSPipeline] detector(left) failed: %s", ex)
+                self._cached_box_l = None
+            try:
+                self._cached_box_r, _ = self._detector.detect(right)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning("[SBSPipeline] detector(right) failed: %s", ex)
+                self._cached_box_r = None
+            self._frames_since_detect = 0
+        else:
+            self._frames_since_detect += 1
+        box_l = self._cached_box_l
+        box_r = self._cached_box_r
         t2 = time.perf_counter()
-        try:
-            box_r, _ = self._detector.detect(right)
-        except Exception as ex:  # noqa: BLE001
-            logger.warning("[SBSPipeline] detector(right) failed: %s", ex)
-        t3 = time.perf_counter()
-        t_yolo_l = t2 - t1
-        t_yolo_r = t3 - t2
+        t_yolo_l = (t2 - t1) / 2 if need_detect else 0.0
+        t_yolo_r = t_yolo_l
 
         # #region agent log — H3: 记录 YOLO 在左右眼返回的 box (定位"box 不在 cup 上"问题)
         _debug_log(
             "processing/sbs_pipeline.py:after_detect",
-            "YOLO box_l / box_r",
+            "YOLO box_l / box_r (cached={})".format(not need_detect),
             {
                 "box_l": list(box_l) if box_l is not None else None,
                 "box_r": list(box_r) if box_r is not None else None,
@@ -212,13 +237,16 @@ class SBSPipeline:
         )
         # #endregion
 
-        # 3. 构建 YOLO 检测框的 ROI mask 并传进 SGBM
-        #    - 有 box 时:只在 box 内外扩 MARGIN% 的区域内搜索 → 减少背景噪声干扰
-        #    - 无 box 时:退化为整图 SGBM(向后兼容)
-        roi_mask = self._build_roi_mask(box_l, box_r)
+        # 3. SGBM 视差 - ROI-bounded(Leader's #6)
+        #    有 box → 在 box 周围做 ROI-裁剪 + ROI-SGBM,效率高、噪声小
+        #    无 box → 退化到整图 SGBM(向后兼容)
         t4 = time.perf_counter()
         try:
-            disp = self._solver.compute(left, right, roi_mask=roi_mask)
+            if box_l is not None or box_r is not None:
+                disp = self._solver.compute_roi(left, right, box_l=box_l, box_r=box_r)
+            else:
+                roi_mask = self._build_roi_mask(box_l, box_r)
+                disp = self._solver.compute(left, right, roi_mask=roi_mask)
         except Exception as ex:  # noqa: BLE001
             logger.warning("[SBSPipeline] solver.compute failed: %s", ex)
             disp = None

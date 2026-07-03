@@ -11,8 +11,26 @@ from __future__ import annotations
 
 import asyncio
 import json
-
+import os
+import time
 from aiohttp import web
+
+# #region agent log — DEBUG mode instrumentation
+_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "debug-c7ffa8.log")
+def _dbg(hyp, msg, data):
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": "c7ffa8",
+                "location": "routers/stream_router.py",
+                "hypothesisId": hyp,
+                "message": msg,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            }) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 from config import (
     MONO_HEIGHT,
@@ -45,9 +63,33 @@ def _build_frame_fn(app: web.Application):
     sbs_queue = app.get(SBS_QUEUE_KEY)
     cam = app.get(CAMERA_KEY)
 
+    # #region agent log — DEBUG mode instrumentation
+    _dbg("BF1", "_build_frame_fn start", {"sbs_queue_is_none": sbs_queue is None, "cam_is_none": cam is None})
+    # #endregion
+
     if sbs_queue is not None:
+        # #region agent log — DEBUG mode instrumentation
+        import time as _t
+        _pull_count = [0]
+        _pull_none_count = [0]
+        _enc_ms_total = [0.0]
+        _enc_ms_max = [0.0]
+        _enc_count = [0]
+        # #endregion
         def frame_fn():
             result = sbs_queue.pull()
+            # #region agent log — DEBUG mode instrumentation
+            _pull_count[0] += 1
+            if result is None:
+                _pull_none_count[0] += 1
+            if _pull_count[0] % 30 == 1:
+                _dbg("MJ1", "sbs_queue.pull", {
+                    "calls": _pull_count[0],
+                    "none_rate": _pull_none_count[0] / max(_pull_count[0], 1),
+                    "enc_avg_ms": _enc_ms_total[0] / max(_enc_count[0], 1),
+                    "enc_max_ms": _enc_ms_max[0],
+                })
+            # #endregion
             if result is not None:
                 return result[0]  # (frame, timestamp)
             return None

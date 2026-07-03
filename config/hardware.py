@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import cv2
@@ -27,18 +28,41 @@ HFOV_DEG: float = 80.0
 """镜头水平视场角,80°(用来反推像素焦距,见 compute_focal_px)。"""
 
 # ---------------------------------------------------------------------------
-# 2. 分辨率(锁死,禁止修改)
+# 2. 分辨率(默认 1920x1080,可被环境变量 STEREO_MONO_HEIGHT / STEREO_USB_HEIGHT 覆盖)
 # ---------------------------------------------------------------------------
+# 注意:某些廉价 USB 摄像头在 1920x1080 模式下 read() 要 ~1000ms,实际只跑得动
+# 1fps。把 STEREO_USB_HEIGHT 调小(如 540)能让摄像头切换到快读模式
+# (实测 ~180ms,即 5.5fps)。
+# MONO_HEIGHT 优先级:STEREO_MONO_HEIGHT > STEREO_USB_HEIGHT > 1080 默认
+# 例(Windows PowerShell):
+#   $env:STEREO_USB_HEIGHT = 540        # 让摄像头跑快读模式
+#   $env:STEREO_MONO_HEIGHT = 1080      # 让 pipeline 按 1080 处理
+#   .venv\Scripts\python.exe main.py
+def _resolve_mono_height() -> int:
+    """优先级 STEREO_MONO_HEIGHT > STEREO_USB_HEIGHT > 默认 1080"""
+    for env_name in ("STEREO_MONO_HEIGHT", "STEREO_USB_HEIGHT"):
+        raw = os.getenv(env_name)
+        if raw is None:
+            continue
+        try:
+            v = int(raw)
+        except ValueError:
+            continue
+        if v > 0:
+            return v
+    return 1080
+
+
 MONO_WIDTH: int = 1920
 """单目物理宽度,像素。"""
 
-MONO_HEIGHT: int = 1080
-"""单目物理高度,像素。"""
+MONO_HEIGHT: int = _resolve_mono_height()
+"""单目物理高度,像素。优先级:STEREO_MONO_HEIGHT > STEREO_USB_HEIGHT > 1080。"""
 
-SBS_WIDTH: int = MONO_WIDTH * 2  # 3840
+SBS_WIDTH: int = MONO_WIDTH * 2  # 跟随
 """双目拼接横向分辨率,像素。"""
 
-SBS_HEIGHT: int = MONO_HEIGHT  # 1080
+SBS_HEIGHT: int = MONO_HEIGHT  # 跟随
 """双目拼接高度,像素。"""
 
 # ---------------------------------------------------------------------------

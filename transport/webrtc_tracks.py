@@ -4,9 +4,36 @@ ZEDTrack is lazily imported to avoid a hard aiortc dependency at import time.
 """
 from __future__ import annotations
 
+import json
+import os
+import time as _time
+
 from .mjpeg_stream import mjpeg_generator
 
 __all__ = ["ZEDTrack", "mjpeg_generator"]
+
+
+_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "debug-c7ffa8.log",
+)
+
+
+def _dbg(hyp, msg, data):
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {
+                    "sessionId": "c7ffa8",
+                    "location": "transport/webrtc_tracks.py",
+                    "hypothesisId": hyp,
+                    "message": msg,
+                    "data": data,
+                    "timestamp": int(_time.time() * 1000),
+                }
+            ) + "\n")
+    except Exception:
+        pass
 
 
 def ZEDTrack(frame_fn_or_queue, fps=15, fallback_shape=(480, 640, 3)):

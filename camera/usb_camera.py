@@ -299,15 +299,33 @@ class USBCamera(StereoCameraBase):
 
         这是给阶段 2 SGBM 算深度 + 阶段 4 管线拼 SBS 用的"原子接口":
         - 读一次 raw 帧
+        - 高度对齐到 ``MONO_HEIGHT``(摄像头在低 STEREO_USB_HEIGHT 模式下实际
+          返回的高度可能与请求不一致,如设 540 但拿到 1072;若
+          ``STEREO_MONO_HEIGHT`` 与 ``STEREO_USB_HEIGHT`` 也会不一致)
         - 做极线校正
         - 返回 (mono_h, mono_w, 3) × 2
 
         无帧可读(摄像头断开)时返回 ``None``。
         """
+        from config.hardware import MONO_HEIGHT, MONO_WIDTH
+
         raw = self._read_raw()
         if raw is None:
             return None
-        return self._apply_rectify(*raw)
+        left, right = raw
+        # 高度对齐:某些 USB 摄像头在 ``STEREO_USB_HEIGHT`` 较低时实际返回的
+        # 帧高会与 ``MONO_HEIGHT`` 不一致。把它们 resize 到 ``MONO_HEIGHT``,
+        # 保证下游 pipeline 收到的尺寸与 ``MONO_HEIGHT`` 完全一致。
+        if left.shape[0] != MONO_HEIGHT:
+            left = cv2.resize(
+                left, (MONO_WIDTH, MONO_HEIGHT),
+                interpolation=cv2.INTER_LINEAR,
+            )
+            right = cv2.resize(
+                right, (MONO_WIDTH, MONO_HEIGHT),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        return self._apply_rectify(left, right)
 
     def read_stereo(self) -> np.ndarray | None:
         """Return SBS BGR image (left+right concatenated) or None on error.

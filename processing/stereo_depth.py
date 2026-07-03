@@ -192,6 +192,204 @@ class StereoDepthSolver:
             pass
         return info
 
+    def compute_roi(
+        self,
+        left_rect: np.ndarray,
+        right_rect: np.ndarray,
+        box_l: tuple[int, int, int, int] | None = None,
+        box_r: tuple[int, int, int, int] | None = None,
+    ) -> np.ndarray:
+        """ROI-bounded SGBM (leader recommendation #6).
+
+        After YOLO detects the cup in both eyes, the cup occupies a small
+        fraction of the 1920×1080 image (typically <25%). Running SGBM on the
+        full image is wasteful — both the SGBM cost and the cost of cropping
+        to SGBM resolution scale with pixel count.
+
+        This method:
+        1. Computes a "stereo ROI" from the union of ``box_l`` and ``box_r``
+           with margin; the right-eye ROI extends LEFT by
+           ``SGBM_NUM_DISPARITIES`` pixels to allow disparity search.
+        2. Crops left_rect/right_rect to the stereo ROI (much smaller area).
+        3. Resizes the cropped region to SGBM internal size.
+        4. Runs SGBM on the smaller, content-focused region.
+        5. Places the disparity result back into a full-size map at the
+           ROI location (zero elsewhere) so existing ``read_depth_in_box``
+           keeps working unchanged.
+
+        When ``box_l`` and ``box_r`` are both ``None``, falls back to
+        :meth:`compute` (full-image SGBM, backward-compatible).
+
+        Args:
+            left_rect, right_rect: 已校正 BGR 图 (MONO_HEIGHT, MONO_WIDTH, 3).
+            box_l, box_r: (x1, y1, x2, y2) cup boxes from YOLO, in MONO coords.
+
+        Returns:
+            disp_at_mono: full-size disparity map (MONO_HEIGHT, MONO_WIDTH).
+            Pixels outside the ROI are 0 (invalid).
+        """
+        if box_l is None and box_r is None:
+            return self.compute(left_rect, right_rect)
+
+        h, w = left_rect.shape[:2]
+        # ── 1. Compute stereo ROI ────────────────────────────────────
+        # Y range: union of both boxes (cup appears at similar y in both eyes
+        # since the cameras are nearly co-located).
+        # X range: union of both boxes.
+        # NOTE: We do NOT add a separate "disparity padding" column for the
+        # right eye. cv2.StereoSGBM requires left.size() == right.size()
+        # (asserts it at runtime). The internal numDisparities (192) already
+        # limits how far left SGBM searches in the right image; if YOLO saw
+        # the cup in both eyes, the right-eye cup position is inside the
+        # same x-range (modulo disparity ≤ numDisp) — the cup appears
+        # SHIFTED-LEFT in the right eye, but the right-eye cup is still
+        # within [min(box_l.x1, box_r.x1), max(box_l.x2, box_r.x2)].
+        margin_x = 40
+        margin_y = 40
+
+        if box_l is not None and box_r is not None:
+            x1_l, y1_l, x2_l, y2_l = box_l
+            x1_r, y1_r, x2_r, y2_r = box_r
+            roi_y1 = max(0, min(y1_l, y1_r) - margin_y)
+            roi_y2 = min(h, max(y2_l, y2_r) + margin_y)
+            roi_x1 = max(0, min(x1_l, x1_r) - margin_x)
+            roi_x2 = min(w, max(x2_l, x2_r) + margin_x)
+        elif box_l is not None:
+            x1_l, y1_l, x2_l, y2_l = box_l
+            roi_x1 = max(0, x1_l - margin_x)
+            roi_y1 = max(0, y1_l - margin_y)
+            roi_x2 = min(w, x2_l + margin_x)
+            roi_y2 = min(h, y2_l + margin_y)
+        else:  # box_r is not None
+            x1_r, y1_r, x2_r, y2_r = box_r
+            roi_x1 = max(0, x1_r - margin_x)
+            roi_y1 = max(0, y1_r - margin_y)
+            roi_x2 = min(w, x2_r + margin_x)
+            roi_y2 = min(h, y2_r + margin_y)
+
+        # Enforce minimum ROI size — too small a crop means SGBM has insufficient
+        # context to match. Fall back to full image in that case.
+        roi_w = roi_x2 - roi_x1
+        roi_h = roi_y2 - roi_y1
+        if roi_w < SGBM_WIDTH // 2 or roi_h < SGBM_HEIGHT // 2:
+            _debug_log(
+                "processing/stereo_depth.py:compute_roi",
+                "roi_too_small_fallback_full",
+                {"roi_w": roi_w, "roi_h": roi_h},
+                "SGBM",
+            )
+            return self.compute(left_rect, right_rect)
+
+        # ── 2. Crop left and right to the SAME ROI ─────────────────
+        # IMPORTANT: both eyes cropped to identical (roi_w × roi_h) so that
+        # cv2.StereoSGBM's size assertion passes.
+        crop_l = left_rect[roi_y1:roi_y2, roi_x1:roi_x2]
+        crop_r = right_rect[roi_y1:roi_y2, roi_x1:roi_x2]
+        if crop_l.shape != crop_r.shape:
+            _debug_log(
+                "processing/stereo_depth.py:compute_roi",
+                "crop_shape_mismatch_fallback_full",
+                {
+                    "crop_l_shape": list(crop_l.shape),
+                    "crop_r_shape": list(crop_r.shape),
+                },
+                "SGBM",
+            )
+            return self.compute(left_rect, right_rect)
+
+        gray_l = cv2.cvtColor(crop_l, cv2.COLOR_BGR2GRAY)
+        gray_r = cv2.cvtColor(crop_r, cv2.COLOR_BGR2GRAY)
+
+        # ── 3. CLAHE + brightness balance (same as full-image path) ──
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_l = clahe.apply(gray_l)
+        gray_r = clahe.apply(gray_r)
+        mean_l = gray_l.mean()
+        mean_r = gray_r.mean()
+        if mean_l > 1 and mean_r > 1:
+            balance = np.clip(mean_l / mean_r, 0.6, 1.8)
+            gray_r = np.clip(gray_r * balance, 0, 255).astype(np.uint8)
+
+        # ── 4. Resize cropped ROI to SGBM internal size ─────────────
+        gray_l_sgbm, scale = resize_for_sgbm(gray_l)
+        gray_r_sgbm, _ = resize_for_sgbm(gray_r)
+
+        # ── 5. Run SGBM on the smaller, content-focused region ──────
+        _debug_log(
+            "processing/stereo_depth.py:compute_roi",
+            "before_sgbm_compute_roi",
+            {
+                "crop_shape": list(crop_l.shape[:2]),
+                "sgbm_shape": list(gray_l_sgbm.shape),
+                "scale": round(scale, 4),
+                "speedup_full_to_roi": round(
+                    (1080 * 1920) / max(1, gray_l_sgbm.size * (scale ** -2)),
+                    2,
+                ),
+            },
+            "SGBM",
+        )
+        t_sgbm_start = time.perf_counter()
+        disp_sgbm_x16 = self._matcher.compute(gray_l_sgbm, gray_r_sgbm)
+        t_sgbm_end = time.perf_counter()
+        disp_sgbm = disp_sgbm_x16.astype(np.float32) / 16.0
+
+        # Median-blur cleanup at SGBM resolution
+        max_disp = max(1.0, disp_sgbm.max())
+        disp_u8 = np.clip(disp_sgbm / max_disp * 255.0, 0, 255).astype(np.uint8)
+        if SGBM_MEDIAN_KSIZE > 1:
+            disp_u8 = cv2.medianBlur(disp_u8, SGBM_MEDIAN_KSIZE)
+        disp_sgbm = disp_u8.astype(np.float32) / 255.0 * max_disp
+        _debug_log(
+            "processing/stereo_depth.py:compute_roi",
+            "sgbm_compute_done_roi",
+            {"sgbm_ms": round((t_sgbm_end - t_sgbm_start) * 1000, 1)},
+            "SGBM",
+        )
+
+        # ── 6. Map disparity back to crop coords then to mono coords ─
+        inv_scale = 1.0 / scale if scale > 0 else 1.0
+        # Resize disparity to crop size (interp at small region resolution)
+        disp_at_crop = cv2.resize(
+            disp_sgbm,
+            (crop_l.shape[1], crop_l.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        ) * np.float32(inv_scale)
+        disp_at_crop = np.where(disp_at_crop > 0, disp_at_crop, 0.0).astype(np.float32)
+
+        # ── 7. Place into full-size output (zero outside ROI) ───────
+        disp_at_mono = np.zeros((h, w), dtype=np.float32)
+        # SGBM's disparity output is referenced to LEFT-eye pixel positions:
+        # for pixel (x_l, y) in left, d = x_l - x_r. The cropped left and
+        # right regions share the SAME x-range [roi_x1, roi_x2) in mono
+        # coords, so disp_at_crop[y, x] corresponds to mono pixel
+        # (roi_y1 + y, roi_x1 + x).
+        disp_at_mono[roi_y1:roi_y2, roi_x1:roi_x2] = disp_at_crop[
+            : roi_y2 - roi_y1, : roi_x2 - roi_x1
+        ]
+        # Zero out any negative values leaking through
+        disp_at_mono = np.where(disp_at_mono > 0, disp_at_mono, 0.0).astype(np.float32)
+
+        # ── 8. Match-confidence (same formula as compute) ────────────
+        with self._state_lock:
+            valid = disp_at_mono > 0
+            valid_count = int(valid.sum())
+            total_count = int(disp_at_mono.size)
+            valid_ratio = valid_count / max(1, total_count)
+            if valid_ratio > 0.005 and valid_count > 100:
+                valid_disp = disp_at_mono[valid]
+                cv = float(valid_disp.std() / (valid_disp.mean() + 1e-6))
+                self._match_confidence = round(
+                    float(np.clip(valid_ratio * (1.0 - cv), 0.0, 1.0)), 3
+                )
+            else:
+                # ROI has few valid pixels (e.g., empty ROI); keep previous
+                self._match_confidence = max(0.0, self._match_confidence - 0.05)
+
+        with self._state_lock:
+            self._last_disp_at_mono = disp_at_mono
+        return disp_at_mono
+
     def compute(
         self,
         left_rect: np.ndarray,
@@ -250,8 +448,31 @@ class StereoDepthSolver:
         gray_l_sgbm, scale = resize_for_sgbm(gray_l)
         gray_r_sgbm, _ = resize_for_sgbm(gray_r)
 
+        # #region agent log — 确认 SGBM 输入尺寸和 compute 耗时
+        _debug_log(
+            "processing/stereo_depth.py:compute",
+            "before_sgbm_compute",
+            {
+                "gray_l_sgbm_shape": list(gray_l_sgbm.shape),
+                "scale": round(scale, 4),
+                "numDisparities": SGBM_NUM_DISPARITIES,
+                "blockSize": SGBM_BLOCK_SIZE,
+                "P1": SGBM_P1_MULT * 3 * SGBM_BLOCK_SIZE ** 2,
+                "P2": SGBM_P2_MULT * 3 * SGBM_BLOCK_SIZE ** 2,
+            },
+            "SGBM",
+        )
+        t_sgbm_start = time.perf_counter()
         # SGBM 在 16 倍定点上输出
         disp_sgbm_x16 = self._matcher.compute(gray_l_sgbm, gray_r_sgbm)
+        t_sgbm_end = time.perf_counter()
+        _debug_log(
+            "processing/stereo_depth.py:compute",
+            "sgbm_compute_done",
+            {"sgbm_ms": round((t_sgbm_end - t_sgbm_start) * 1000, 1)},
+            "SGBM",
+        )
+        # #endregion
         disp_sgbm = disp_sgbm_x16.astype(np.float32) / 16.0
 
         # 去无效区域散斑(在 SGBM 分辨率上做,比在 mono 分辨率上做更高效)

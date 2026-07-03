@@ -152,6 +152,7 @@ class CupDetector:
                     21.0 if "Dml" in used else 70.0,
                 )
             except Exception as ex:
+                timestamped_print(f"[CupDetector] ONNX load failed ({ex}), falling back to PyTorch YOLO")
                 logger.warning("[CupDetector] ONNX load failed (%s), falling back to PyTorch YOLO", ex)
 
         # 2. 退路: PyTorch YOLO CPU
@@ -165,7 +166,7 @@ class CupDetector:
                 w = str(w)
             self._yolo_model = YOLO(w)
             self._yolo_model.to("cpu")
-            logger.info("[CupDetector] PyTorch YOLO (CPU) loaded from %s", w)
+            logger.info("[CupDetector] PyTorch YOLO (CPU) loaded from %s — WARNING: slow (~60-80ms)", w)
 
         logger.info("[CupDetector] Ready, class=%d (%s)", TARGET_CLS_ID, TARGET_CLS_NAME)
         _debug_log(
