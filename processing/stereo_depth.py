@@ -11,9 +11,11 @@
 Bug fix(2026-06-17):
 - 新增 :meth:`StereoDepthSolver.read_depth_in_box`,在 box 内做网格多点采样取中位数,
   解决 cup 中心点落在杯柄/反光区导致单点 SGBM 视差无效的问题。
-- 修正 :meth:`StereoDepthSolver.read_depth_at` 的钳位语义:
-  视差无效(d <= 0)或公式输出超出钳位范围时,直接返回 ``None`` 让 UI 显示"无有效深度",
-  不再被钳位到 0.5 cm(这会让用户误以为物体在 0.5 cm 处)。
+
+Refactor(2026-07-03):
+- ``read_depth_at`` 单点采样已删除:单点采样在杯柄/反光区噪点极大,
+  精度不可控;统一改用框内多点采样 + 直方图峰值 + 2D 高斯空间加权 +
+  trimmed mean(见 :meth:`read_depth_in_box`)。
 """
 from __future__ import annotations
 
@@ -513,50 +515,6 @@ class StereoDepthSolver:
             self._last_disp_at_mono = disp_at_mono
         return disp_at_mono
 
-    def read_depth_at(
-        self,
-        cx: int,
-        cy: int,
-        disp: np.ndarray | None = None,
-        use_cache: bool = True,
-    ) -> Optional[float]:
-        """在 mono 视差图上读 (cx, cy) 处的视差,转成深度(cm)。
-
-        Args:
-            cx, cy: 像素坐标(整数,基于单眼 1920x1080)。
-            disp: 视差图;为 None 时用上次 :meth:`compute` 缓存的结果。
-            use_cache: 保留参数(与早期版本兼容),当前等价于 ``disp is None``。
-
-        Returns:
-            深度(cm),1 位小数;无效(视差 <= 0、越界、计算结果超出钳位范围)
-            时返回 ``None``,**不**被钳位到 0.5 cm(避免误导用户)。
-        """
-        if disp is None:
-            disp = self._last_disp_at_mono
-        if disp is None:
-            return None
-
-        h, w = disp.shape[:2]
-        if not (0 <= cx < w and 0 <= cy < h):
-            return None
-
-        d = float(disp[cy, cx])
-        if d <= 0:
-            return None
-
-        try:
-            z_cm = z_cm_from_disparity(d)
-        except ValueError:
-            return None
-
-        # 钳位语义修正(2026-06-17):
-        # 视差有效时算出的 Z,如果落在 [DEPTH_MIN_CM, DEPTH_MAX_CM] 内,直接 round 输出;
-        # 超出这个范围(过近 / 过远)说明视差虽然>0但实际不可信,
-        # **不再**被钳位到 0.5/100,而是返回 None 让 UI 显式提示"无有效深度"。
-        if not (DEPTH_MIN_CM <= z_cm <= DEPTH_MAX_CM):
-            return None
-        return round(z_cm, 1)
-
     def read_depth_in_box(
         self,
         box: tuple[int, int, int, int],
@@ -665,10 +623,78 @@ class StereoDepthSolver:
             if len(z_final) < 5:
                 z_final = z_vals
 
+        # ── 2D 空间加权 + trimmed mean(2026-07-03,平滑优化)──────────────────
+        # 杯面中心比边缘更可靠(中心光照均匀、纹理清晰、视差匹配率高)。
+        # 直方图峰值之后留下的"主体像素"绝大多数是杯子表面,但仍有少量
+        # 杯柄/杯底/反光边缘的离群点。trim 5% 极端值 + 中心高斯加权双重
+        # 抑制残余跳动。
+        if len(z_final) >= 20:
+            # Trimmed mean:去最大最小各 5%
+            z_sorted = np.sort(z_final)
+            n_trim = max(1, int(len(z_sorted) * 0.05))
+            z_trimmed = z_sorted[n_trim:len(z_sorted) - n_trim] if len(z_sorted) > 2 * n_trim else z_sorted
+
+            # 2D 高斯权重:中心 = 1.0,边缘 = 0.3
+            # box 中心 = ((x1+x2)/2, (y1+y2)/2);用 (dx, dy) 距离归一化到 [-1, 1]
+            cx_box = (x1 + x2) / 2.0
+            cy_box = (y1 + y2) / 2.0
+            rx_box = max(1.0, (x2 - x1) / 2.0)
+            ry_box = max(1.0, (y2 - y1) / 2.0)
+
+            # 提取 z_final 对应的像素 (yy, xx) 坐标
+            # region[yy, xx] > 0 → in_mask。重新做一遍对齐:把 z_final 的 mask
+            # 在 in_range 后的 valid_mask 上累加权重。最简实现:用一个均匀权重
+            # 数组,后续对裁剪后的 z_final 用 1D 索引(假设 trim 前后顺序稳定)。
+            # np.sort 默认 stable,保持 z_final 的原顺序 → 取 z_final 排序前的索引。
+            z_orig_idx = np.argsort(z_final)  # 升序排序的索引
+            # 重新映射 trimmed 范围到 z_final 索引
+            if n_trim > 0 and len(z_final) > 2 * n_trim:
+                kept_idx = z_orig_idx[n_trim:len(z_final) - n_trim]
+            else:
+                kept_idx = z_orig_idx
+            # kept_idx 在 z_final 里的位置;再在 region 坐标系里取 (yy, xx)
+            ys_in_region, xs_in_region = np.where(valid_mask)
+            # 注意:这里 in_range 还会进一步过滤;先在 valid_mask 上统计 z_final 对应的点
+            # 因为 z_final ⊆ in_range ⊆ valid_mask,所以 z_final 对应的 (y, x) 是
+            # valid_mask 的子集。
+            #
+            # 做法:对 z_vals 重建 (y_rel, x_rel) 索引。in_range 内的 (y, x) 等于
+            # np.where(valid_mask)[0][in_range_in_valid]。
+            in_range_in_valid = np.zeros_like(valid_mask)
+            in_range_in_valid[valid_mask] = in_range
+            # 现在 in_range_in_valid 是和 region 同形状的 bool mask
+            ys_ir, xs_ir = np.where(in_range_in_region := in_range_in_valid)
+            # z_final 的长度 == len(ys_ir)  (z_final ⊆ in_range)
+            if len(ys_ir) == len(z_final):
+                # 重新做 trim:z_final 排序前后索引映射
+                # 把 z_final 排序后,kept 像素的 (yy, xx) 拿来做高斯加权
+                kept_y = ys_ir[kept_idx]
+                kept_x = xs_ir[kept_idx]
+                # 归一化到 [-1, 1]
+                nx = (kept_x - cx_box + (x1 - x1)) / rx_box  # 简化:直接用 region 内坐标
+                # 上面 cx_box 已经是绝对坐标,region 内坐标 = 绝对 - x1
+                nx = (kept_x - (cx_box - x1)) / rx_box
+                ny = (kept_y - (cy_box - y1)) / ry_box
+                weights = np.exp(-(nx * nx + ny * ny) / 2.0)
+                w_sum = float(weights.sum())
+                if w_sum > 0:
+                    z_gauss = float(np.sum(z_final[kept_idx] * weights) / w_sum)
+                    z_median = float(np.median(z_trimmed))
+                    # 加权均值 + 中位数 8:2 混合(均值得主,中位数抗离群)
+                    result_z = 0.8 * z_gauss + 0.2 * z_median
+                else:
+                    result_z = float(np.median(z_trimmed))
+            else:
+                # 长度对不齐,fall back 到 trimmed median
+                result_z = float(np.median(z_trimmed))
+        else:
+            # 样本太少,直接用中位数
+            result_z = float(np.median(z_final))
+
         d_median = float(np.median(valid_d_in_range))
         with self._state_lock:
             self._last_d_median = d_median
-        result = round(float(np.median(z_final)), 1)
+        result = round(float(result_z), 1)
         _debug_log(
             "processing/stereo_depth.py:read_depth_in_box",
             "SUCCESS z returned (histogram peak)",
@@ -681,6 +707,7 @@ class StereoDepthSolver:
                 "BASELINE_CM": BASELINE_CM,
                 "DISP_SCALE": ds,
                 "z_peak": float(np.median(z_final)),
+                "z_weighted": result_z,
                 "z_returned": result,
                 "suggested_SCALE_for_realZ_25cm": (f_px * BASELINE_CM) / (25.0 * d_median),
                 "suggested_SCALE_for_realZ_30cm": (f_px * BASELINE_CM) / (30.0 * d_median),
@@ -854,9 +881,10 @@ if __name__ == "__main__":
     # 公式自检:不依赖摄像头
     print("formula self-check (literal task spec):")
     print(f"  Z_cm(d) = (f_px * BASELINE_CM) / (d * DISP_SCALE)")
-    print(f"  f_px = {compute_focal_px():.2f}, BASELINE_CM = {BASELINE_CM}, DISP_SCALE = {DISP_SCALE}")
+    print(f"  f_px = {compute_focal_px():.2f}, BASELINE_CM = {BASELINE_CM}, "
+          f"DISP_SCALE = {get_disp_scale()} (live; default module const = {DISP_SCALE})")
     for d in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]:
-        z_cm_real = (compute_focal_px() * BASELINE_CM) / (d * DISP_SCALE)
+        z_cm_real = (compute_focal_px() * BASELINE_CM) / (d * get_disp_scale())
         # 反推:如果看到 z_cm_real,需要多少视差
         print(f"  d={d:6.1f} px -> Z_cm = {z_cm_real:7.2f} cm")
     print(f"  DEPTH_SMOOTH_WINDOW={DEPTH_SMOOTH_WINDOW}, "

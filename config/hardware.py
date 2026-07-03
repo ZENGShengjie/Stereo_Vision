@@ -11,9 +11,91 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from threading import RLock
 
 import cv2
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Dynamic hardware parameter overrides (live-tunable via API + persisted to disk)
+# ---------------------------------------------------------------------------
+# Architecture (2026-07-03):
+# - The build-time defaults below are the "source of truth" for code that runs
+#   during import (e.g. assert in stereo_depth.py).
+# - Runtime mutations (POST /api/calibrate/disp_scale) are stored in
+#   ``_OVERRIDES``, a thread-safe dict.
+# - :func:`get_disp_scale` (and the analogous getters added later) is the ONLY
+#   safe way for code to read these values at runtime — it falls back to the
+#   module constant if no override is set.
+# - :func:`set_disp_scale` writes to both the live dict and a JSON file at
+#   ``data/hardware_overrides.json`` so values survive a server restart.
+# - Every mutation is appended to ``data/hardware_override_log.jsonl`` (one
+#   line per change) for audit / tuning forensics.
+# ---------------------------------------------------------------------------
+_OVERRIDES: dict[str, float] = {}
+_OVERRIDES_LOCK = RLock()
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_OVERRIDES_FILE = _DATA_DIR / "hardware_overrides.json"
+_OVERRIDES_LOG = _DATA_DIR / "hardware_override_log.jsonl"
+
+
+def _load_overrides() -> None:
+    """Read persisted overrides from disk into ``_OVERRIDES`` (called at import).
+
+    Silent on missing/corrupt files — build-time defaults remain authoritative
+    until the operator explicitly calls :func:`set_disp_scale`.
+    """
+    if not _OVERRIDES_FILE.exists():
+        return
+    try:
+        import json
+        with _OVERRIDES_FILE.open(encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _OVERRIDES_LOCK:
+                for k, v in data.items():
+                    if isinstance(v, (int, float)):
+                        _OVERRIDES[k] = float(v)
+    except Exception:
+        pass
+
+
+def _persist_overrides() -> None:
+    """Write ``_OVERRIDES`` to ``hardware_overrides.json`` (best-effort)."""
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        import json
+        with _OVERRIDES_LOCK:
+            snapshot = dict(_OVERRIDES)
+        with _OVERRIDES_FILE.open("w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _log_override(key: str, old: float, new: float, source: str, extra: dict | None = None) -> None:
+    """Append one NDJSON line to the audit log (best-effort)."""
+    try:
+        import json
+        import time
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts_ms": int(time.time() * 1000),
+            "key": key,
+            "old": old,
+            "new": new,
+            "source": source,
+        }
+        if extra:
+            payload.update(extra)
+        with _OVERRIDES_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# Load persisted overrides eagerly so the first frame after restart already uses them.
+_load_overrides()
 
 # ---------------------------------------------------------------------------
 # 1. 摄像头光学
@@ -217,6 +299,7 @@ def z_cm_from_disparity(disp: float) -> float:
       (3mm + 80° → ~1144 px),这是真实双目三角测距公式
     - ``d`` —— SGBM 输出的像素视差
     - ``DISP_SCALE`` —— 校准系数,见 :data:`DISP_SCALE` 说明,默认 4.0
+      实际值通过 :func:`get_disp_scale` 实时读取(支持热更新)
 
     **历史**:原公式 ``Z_cm = (FOCAL_LENGTH_MM * BASELINE_CM * 10) / d / 10``
     = ``18 / d`` 仅用物理焦距 3mm 不带像素焦距,与真实物理 cm 有 ~4 倍尺度差。
@@ -234,7 +317,59 @@ def z_cm_from_disparity(disp: float) -> float:
     if disp <= 0:
         raise ValueError(f"disp must be > 0, got {disp}")
     f_px = compute_focal_px()
-    return (f_px * BASELINE_CM) / (disp * DISP_SCALE)
+    return (f_px * BASELINE_CM) / (disp * get_disp_scale())
+
+
+# ---------------------------------------------------------------------------
+# Public API for runtime-tunable hardware parameters (2026-07-03)
+# ---------------------------------------------------------------------------
+def get_disp_scale() -> float:
+    """Read the live DISP_SCALE (override → build-time default).
+
+    Always call this instead of importing the constant directly when computing
+    depth. Reading the constant via ``from config.hardware import DISP_SCALE``
+    captures the import-time value, which means a runtime ``POST /api/calibrate
+    /disp_scale`` would not be visible to the depth formula.
+    """
+    with _OVERRIDES_LOCK:
+        v = _OVERRIDES.get("DISP_SCALE")
+    if v is not None and v > 0:
+        return float(v)
+    return float(DISP_SCALE)
+
+
+def set_disp_scale(new_value: float, *, source: str = "api", extra: dict | None = None) -> dict:
+    """Update DISP_SCALE in memory, persist to disk, and append an audit line.
+
+    Args:
+        new_value: New scale (must be > 0 and <= 100; sanity bound).
+        source: Short tag for the audit log (e.g. ``"api"`` or ``"cli"``).
+        extra: Optional metadata to attach to the audit log entry.
+
+    Returns:
+        ``{"old": float, "new": float, "persisted": bool}``
+
+    Raises:
+        ValueError: ``new_value`` out of range.
+    """
+    new_value = float(new_value)
+    if not (0.001 <= new_value <= 100.0):
+        raise ValueError(f"DISP_SCALE must be in [0.001, 100], got {new_value}")
+    with _OVERRIDES_LOCK:
+        old_value = _OVERRIDES.get("DISP_SCALE", float(DISP_SCALE))
+        _OVERRIDES["DISP_SCALE"] = new_value
+    _persist_overrides()
+    _log_override("DISP_SCALE", old_value, new_value, source, extra)
+    return {"old": old_value, "new": new_value, "persisted": True}
+
+
+def list_overrides() -> dict[str, dict]:
+    """Return a snapshot of all live overrides (audit-friendly view)."""
+    with _OVERRIDES_LOCK:
+        return {
+            k: {"current": v, "default": float(DISP_SCALE) if k == "DISP_SCALE" else None}
+            for k, v in _OVERRIDES.items()
+        }
 
 
 def resize_for_sgbm(img: np.ndarray) -> tuple[np.ndarray, float]:
@@ -328,4 +463,7 @@ __all__ = [
     "z_cm_from_disparity",
     "resize_for_sgbm",
     "resize_to_mono",
+    "get_disp_scale",
+    "set_disp_scale",
+    "list_overrides",
 ]

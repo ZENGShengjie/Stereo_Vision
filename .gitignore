@@ -8,6 +8,8 @@ env/
 *.pem
 !config/*.pem.example
 data/params*.json
+data/hardware_overrides.json
+data/hardware_override_log.jsonl
 
 # IDE
 .cursor/

@@ -149,6 +149,9 @@ class SBSPipeline:
         self._DETECT_REFRESH_INTERVAL = 2   # refresh every 2 frames
         self._cached_box_l: Optional[Box] = None
         self._cached_box_r: Optional[Box] = None
+        self._cached_candidates_l: list[Box] = []   # 2026-07-03: 视差辅助选最近
+        self._cached_candidates_r: list[Box] = []
+        self._last_disp: Optional[np.ndarray] = None   # 上一帧 SGBM 结果用于筛选
         self._frames_since_detect: int = 0   # counter (also det-skip rate visible in logs)
 
     def process_one_frame(
@@ -199,26 +202,48 @@ class SBSPipeline:
         #    每帧压低到每 2-3 帧一次。cup 通常移动很慢,几个 frame 内 box 漂移可忽略。
         t1 = time.perf_counter()
         need_detect = (
-            self._cached_box_l is None
-            or self._cached_box_r is None
+            not self._cached_candidates_l
+            or not self._cached_candidates_r
             or self._frames_since_detect >= self._DETECT_REFRESH_INTERVAL
         )
         if need_detect:
             try:
-                self._cached_box_l, _ = self._detector.detect(left)
+                cands_l = self._detector.detect_candidates(left, MONO_HEIGHT, MONO_WIDTH)
             except Exception as ex:  # noqa: BLE001
                 logger.warning("[SBSPipeline] detector(left) failed: %s", ex)
-                self._cached_box_l = None
+                cands_l = []
             try:
-                self._cached_box_r, _ = self._detector.detect(right)
+                cands_r = self._detector.detect_candidates(right, MONO_HEIGHT, MONO_WIDTH)
             except Exception as ex:  # noqa: BLE001
                 logger.warning("[SBSPipeline] detector(right) failed: %s", ex)
-                self._cached_box_r = None
+                cands_r = []
+            self._cached_candidates_l = [c[0] for c in cands_l]
+            self._cached_candidates_r = [c[0] for c in cands_r]
             self._frames_since_detect = 0
         else:
             self._frames_since_detect += 1
-        box_l = self._cached_box_l
-        box_r = self._cached_box_r
+
+        # ── 视差辅助选最近(方案 b,2026-07-03)────────────────
+        # 用上一次 cycle 的 SGBM 视差图,从多候选中选"视差最大"的
+        # (视差大 = 近)。第一帧 _last_disp=None → fallback 启发式。
+        if self._last_disp is not None and self._cached_candidates_l:
+            box_l = self._detector.select_nearest(self._cached_candidates_l, self._last_disp)
+        elif self._cached_candidates_l:
+            box_l = self._detector._fallback_heuristic_select(
+                self._cached_candidates_l, MONO_HEIGHT, MONO_WIDTH
+            )[0]
+        else:
+            box_l = None
+        if self._last_disp is not None and self._cached_candidates_r:
+            box_r = self._detector.select_nearest(self._cached_candidates_r, self._last_disp)
+        elif self._cached_candidates_r:
+            box_r = self._detector._fallback_heuristic_select(
+                self._cached_candidates_r, MONO_HEIGHT, MONO_WIDTH
+            )[0]
+        else:
+            box_r = None
+        self._cached_box_l = box_l
+        self._cached_box_r = box_r
         t2 = time.perf_counter()
         t_yolo_l = (t2 - t1) / 2 if need_detect else 0.0
         t_yolo_r = t_yolo_l
@@ -247,6 +272,8 @@ class SBSPipeline:
             else:
                 roi_mask = self._build_roi_mask(box_l, box_r)
                 disp = self._solver.compute(left, right, roi_mask=roi_mask)
+            # 保存本帧视差给下一帧用(视差辅助选最近)
+            self._last_disp = disp
         except Exception as ex:  # noqa: BLE001
             logger.warning("[SBSPipeline] solver.compute failed: %s", ex)
             disp = None
@@ -325,6 +352,11 @@ class SBSPipeline:
         # Push to ring buffer for live stats (thread-safe)
         d_median = self._solver.last_d_median
         match_conf = self._solver.match_confidence
+        # sgbm_path: roi (有 box, ROI-SGBM) / full_image (无 box, 整图) / error (失败)
+        if disp is not None:
+            sgbm_path = "roi" if (box_l is not None or box_r is not None) else "full_image"
+        else:
+            sgbm_path = "error"
         record = {
             "frame": self._frames,
             "total_ms": round(total_ms, 1),
@@ -337,6 +369,7 @@ class SBSPipeline:
             "match_confidence": match_conf,
             "fps_approx": round(1000.0 / total_ms, 1) if total_ms > 0 else 0,
             "d_median": d_median,
+            "sgbm_path": sgbm_path,
             "ts": time.time(),
         }
         with self._stats_lock:
@@ -401,6 +434,21 @@ class SBSPipeline:
             for ref_cm in [10, 15, 20, 25, 30, 40, 50, 60]:
                 suggested_scales[ref_cm] = round((fp * b) / (ref_cm * d_med), 3)
 
+        # Quality label (2026-07-03): 把匹配置信度翻译成"高/中/低"档位,
+        # 前端可以用颜色直观显示。
+        conf = self._solver.match_confidence
+        if conf >= 0.7:
+            quality = "high"
+        elif conf >= 0.4:
+            quality = "medium"
+        else:
+            quality = "low"
+
+        # SGBM path 统计:近 N 帧里有多少走了 ROI-SGBM vs 全图 fallback
+        path_counts = {"roi": 0, "full_image": 0, "no_box": 0, "error": 0}
+        for r in ring:
+            path_counts[r.get("sgbm_path", "error")] = path_counts.get(r.get("sgbm_path", "error"), 0) + 1
+
         return {
             "fps": round(fps, 1),
             "latency_p50_ms": pct(totals_sorted, 50),
@@ -419,7 +467,9 @@ class SBSPipeline:
             "depth_cm": last.get("depth_cm"),
             "d_median_px": d_med,
             "z_measured_cm": z_raw,
-            "match_confidence": self._solver.match_confidence,
+            "match_confidence": conf,
+            "quality": quality,
+            "sgbm_path_counts": path_counts,
             "calib_points": [(round(s, 2), round(t, 2)) for s, t in self._solver.calib_points],
             "suggested_disp_scales": suggested_scales,
         }

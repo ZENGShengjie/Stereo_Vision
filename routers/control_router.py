@@ -46,7 +46,8 @@ async def calibrate_disp_scale_handler(request: web.Request) -> web.Response:
 
     Reads the latest pipeline stats (d_median, z_measured) and computes:
         DISP_SCALE = real_cm / z_measured
-    Then patches config.hardware.DISP_SCALE at runtime.
+    Patches the live override, persists to data/hardware_overrides.json,
+    and appends an entry to data/hardware_override_log.jsonl.
     """
     try:
         data = await request.json()
@@ -76,19 +77,24 @@ async def calibrate_disp_scale_handler(request: web.Request) -> web.Response:
 
     new_scale = round(real_cm / z_measured, 4)
 
-    # Patch the module-level constant at runtime
+    # Update via the dynamic-override layer (persists to disk, appends audit log).
     import config.hardware as hw
-    old_scale = hw.DISP_SCALE
-    hw.DISP_SCALE = new_scale
+    info = hw.set_disp_scale(new_scale, source="api/calibrate/disp_scale", extra={
+        "real_cm": real_cm,
+        "z_measured_cm": z_measured,
+        "d_median_px": d_median,
+    })
 
     return web.json_response({
-        "old_disp_scale": old_scale,
-        "new_disp_scale": new_scale,
+        "old_disp_scale": info["old"],
+        "new_disp_scale": info["new"],
+        "persisted": info["persisted"],
         "real_cm": real_cm,
         "z_measured_cm": z_measured,
         "d_median_px": d_median,
         "formula": f"DISP_SCALE = real_cm / z_measured = {real_cm} / {z_measured} = {new_scale}",
-        "note": "Restart the server to persist; current session updated live",
+        "note": "Persisted to data/hardware_overrides.json; survives restart. "
+                "Audit log: data/hardware_override_log.jsonl",
     })
 
 
@@ -154,5 +160,27 @@ def register_control_routes(app: web.Application) -> None:
     app.router.add_post("/api/params", update_params_handler)
     app.router.add_post("/api/params/reset", reset_params_handler)
     app.router.add_get("/api/status", status_handler)
+    app.router.add_get("/api/calibrate/disp_scale", get_disp_scale_handler)
     app.router.add_post("/api/calibrate/disp_scale", calibrate_disp_scale_handler)
     app.router.add_post("/api/calibrate/depth_ratio", calibrate_depth_ratio_handler)
+
+
+async def get_disp_scale_handler(_request: web.Request) -> web.Response:
+    """GET /api/calibrate/disp_scale — read live value + override status.
+
+    Returns:
+        ``{"disp_scale": float, "default": float, "is_overridden": bool,
+            "all_overrides": {key: {"current", "default"}}}``
+    """
+    import config.hardware as hw
+    current = hw.get_disp_scale()
+    overrides = hw.list_overrides()
+    is_overridden = "DISP_SCALE" in overrides and abs(
+        overrides["DISP_SCALE"]["current"] - float(hw.DISP_SCALE)
+    ) > 1e-9
+    return web.json_response({
+        "disp_scale": current,
+        "default": float(hw.DISP_SCALE),
+        "is_overridden": is_overridden,
+        "all_overrides": overrides,
+    })
