@@ -60,13 +60,15 @@ def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = "?"
         pass
 
 from config.hardware import (
+    ENABLE_RIGHT_DETECT,
     MONO_HEIGHT,
     MONO_WIDTH,
     SBS_HEIGHT,
     SBS_WIDTH,
+    get_hw,
 )
 from processing.detector import CupDetector
-from processing.stereo_depth import StereoDepthSolver
+from processing.stereo_depth import StereoDepthSolver, map_right_compute_roi, map_right_display_box
 from processing.warning import Box, WarningOverlay
 
 logger = logging.getLogger(__name__)
@@ -153,6 +155,8 @@ class SBSPipeline:
         self._cached_candidates_r: list[Box] = []
         self._last_disp: Optional[np.ndarray] = None   # 上一帧 SGBM 结果用于筛选
         self._frames_since_detect: int = 0   # counter (also det-skip rate visible in logs)
+        # 单路模式:右图显示框缓存（用于复用上一帧的显示框位置）
+        self._cached_right_display_box: Optional[Box] = None
 
     def process_one_frame(
         self,
@@ -203,7 +207,7 @@ class SBSPipeline:
         t1 = time.perf_counter()
         need_detect = (
             not self._cached_candidates_l
-            or not self._cached_candidates_r
+            or (ENABLE_RIGHT_DETECT and not self._cached_candidates_r)
             or self._frames_since_detect >= self._DETECT_REFRESH_INTERVAL
         )
         if need_detect:
@@ -212,10 +216,14 @@ class SBSPipeline:
             except Exception as ex:  # noqa: BLE001
                 logger.warning("[SBSPipeline] detector(left) failed: %s", ex)
                 cands_l = []
-            try:
-                cands_r = self._detector.detect_candidates(right, MONO_HEIGHT, MONO_WIDTH)
-            except Exception as ex:  # noqa: BLE001
-                logger.warning("[SBSPipeline] detector(right) failed: %s", ex)
+            # 单路检测模式:仅左图检测,右图不再跑检测器
+            if ENABLE_RIGHT_DETECT:
+                try:
+                    cands_r = self._detector.detect_candidates(right, MONO_HEIGHT, MONO_WIDTH)
+                except Exception as ex:  # noqa: BLE001
+                    logger.warning("[SBSPipeline] detector(right) failed: %s", ex)
+                    cands_r = []
+            else:
                 cands_r = []
             self._cached_candidates_l = [c[0] for c in cands_l]
             self._cached_candidates_r = [c[0] for c in cands_r]
@@ -223,24 +231,36 @@ class SBSPipeline:
         else:
             self._frames_since_detect += 1
 
-        # ── 视差辅助选最近(方案 b,2026-07-03)────────────────
-        # 用上一次 cycle 的 SGBM 视差图,从多候选中选"视差最大"的
-        # (视差大 = 近)。第一帧 _last_disp=None → fallback 启发式。
-        if self._last_disp is not None and self._cached_candidates_l:
-            box_l = self._detector.select_nearest(self._cached_candidates_l, self._last_disp)
-        elif self._cached_candidates_l:
-            box_l = self._detector._fallback_heuristic_select(
-                self._cached_candidates_l, MONO_HEIGHT, MONO_WIDTH
-            )[0]
+        # ── 选框逻辑 ───────────────────────────────────────────────
+        # 双检测模式:左右图各用综合打分选框
+        # 单路模式:仅左图选框，右图不独立检测
+        if ENABLE_RIGHT_DETECT:
+            # 双检测模式:左右图独立选框
+            if self._last_disp is not None and self._cached_candidates_l:
+                box_l = self._detector.select_nearest(self._cached_candidates_l, self._last_disp)
+            elif self._cached_candidates_l:
+                box_l = self._detector._fallback_heuristic_select(
+                    self._cached_candidates_l, MONO_HEIGHT, MONO_WIDTH
+                )[0]
+            else:
+                box_l = None
+            if self._last_disp is not None and self._cached_candidates_r:
+                box_r = self._detector.select_nearest(self._cached_candidates_r, self._last_disp)
+            elif self._cached_candidates_r:
+                box_r = self._detector._fallback_heuristic_select(
+                    self._cached_candidates_r, MONO_HEIGHT, MONO_WIDTH
+                )[0]
+            else:
+                box_r = None
         else:
-            box_l = None
-        if self._last_disp is not None and self._cached_candidates_r:
-            box_r = self._detector.select_nearest(self._cached_candidates_r, self._last_disp)
-        elif self._cached_candidates_r:
-            box_r = self._detector._fallback_heuristic_select(
-                self._cached_candidates_r, MONO_HEIGHT, MONO_WIDTH
-            )[0]
-        else:
+            # 单路模式:仅左图检测，综合打分选框
+            if self._cached_candidates_l:
+                box_l = self._detector._fallback_heuristic_select(
+                    self._cached_candidates_l, MONO_HEIGHT, MONO_WIDTH
+                )[0]
+            else:
+                box_l = None
+            # 右图不独立检测，后续由几何映射生成显示框
             box_r = None
         self._cached_box_l = box_l
         self._cached_box_r = box_r
@@ -269,7 +289,16 @@ class SBSPipeline:
         depth_status = "no_target"   # 2026-07-03: 显式状态机
         try:
             if box_l is not None or box_r is not None:
-                disp = self._solver.compute_roi(left, right, box_l=box_l, box_r=box_r)
+                # 单路检测模式:右图 ROI 由几何映射生成
+                box_r_for_sgbm = box_r
+                if not ENABLE_RIGHT_DETECT and box_l is not None:
+                    # 从 SGBM 参数获取视差范围
+                    min_disp = 0
+                    num_disp = int(get_hw("SGBM_NUM_DISPARITIES"))
+                    box_r_for_sgbm = map_right_compute_roi(
+                        box_l, min_disp, num_disp, MONO_WIDTH, MONO_HEIGHT
+                    )
+                disp = self._solver.compute_roi(left, right, box_l=box_l, box_r=box_r_for_sgbm)
                 depth_status = "valid_disparity_no_depth"  # 有视差但还没算深度
             else:
                 roi_mask = self._build_roi_mask(box_l, box_r)
@@ -309,8 +338,38 @@ class SBSPipeline:
         # 5. 渲染:预警框(各眼自己的 box) + 距离文字(左右眼都画,VR 对称)
         t8 = time.perf_counter()
         try:
+            # 计算右图用于渲染的框
+            # 双检测模式:直接使用检测框
+            # 单路模式:由左图检测框 + 当前帧平均视差映射生成显示框
+            render_box_r = box_r
+            if not ENABLE_RIGHT_DETECT and box_l is not None:
+                # 计算当前帧的平均视差
+                avg_disp = 0.0
+                if disp is not None:
+                    x1, y1, x2, y2 = box_l
+                    # 在左框区域计算有效视差的中位数
+                    roi_disp = disp[y1:y2, x1:x2]
+                    valid_disp = roi_disp[roi_disp > 0]
+                    if len(valid_disp) > 0:
+                        avg_disp = float(np.median(valid_disp))
+                
+                # 计算右图显示框
+                if avg_disp > 0:
+                    display_box = map_right_display_box(
+                        box_l, avg_disp, MONO_WIDTH, MONO_HEIGHT
+                    )
+                    render_box_r = display_box
+                    self._cached_right_display_box = display_box
+                else:
+                    # 无有效视差，复用上一帧的显示框
+                    render_box_r = self._cached_right_display_box
+            elif ENABLE_RIGHT_DETECT:
+                # 双检测模式
+                render_box_r = box_r
+            
+            # 执行渲染
             self._warn.render(left, box_l, depth_cm)
-            self._warn.render(right, box_r, depth_cm)
+            self._warn.render(right, render_box_r, depth_cm)
             self._warn.render_text(left, depth_cm)
             self._warn.render_text(right, depth_cm)
         except Exception as ex:  # noqa: BLE001
@@ -342,6 +401,25 @@ class SBSPipeline:
         }
 
         # #region agent log — 帧级性能日志
+        # 计算当前帧的平均视差
+        avg_disp_px = 0.0
+        if disp is not None and box_l is not None:
+            x1, y1, x2, y2 = box_l
+            roi_disp = disp[y1:y2, x1:x2]
+            valid_disp = roi_disp[roi_disp > 0]
+            if len(valid_disp) > 0:
+                avg_disp_px = round(float(np.median(valid_disp)), 1)
+        
+        # 计算右图计算 ROI 尺寸
+        right_compute_roi_size = None
+        if not ENABLE_RIGHT_DETECT and box_l is not None:
+            min_disp = 0
+            num_disp = int(get_hw("SGBM_NUM_DISPARITIES"))
+            right_roi = map_right_compute_roi(
+                box_l, min_disp, num_disp, MONO_WIDTH, MONO_HEIGHT
+            )
+            right_compute_roi_size = (right_roi[2] - right_roi[0], right_roi[3] - right_roi[1])
+        
         _debug_log(
             "processing/sbs_pipeline.py:frame_perf",
             "frame latency breakdown",
@@ -358,6 +436,8 @@ class SBSPipeline:
                 "box_l": list(box_l) if box_l is not None else None,
                 "box_r": list(box_r) if box_r is not None else None,
                 "frame": self._frames,
+                "roi_mode": "mapped" if not ENABLE_RIGHT_DETECT else "dual_detect",
+                "avg_disp_px": avg_disp_px,
             },
             "PERF",
         )
@@ -386,6 +466,10 @@ class SBSPipeline:
             "d_median": d_median,
             "sgbm_path": sgbm_path,
             "ts": time.time(),
+            # 新增字段
+            "roi_mode": "mapped" if not ENABLE_RIGHT_DETECT else "dual_detect",
+            "avg_disp_px": avg_disp_px,
+            "right_compute_roi_size": right_compute_roi_size,
         }
         with self._stats_lock:
             self._stats_ring.append(record)
@@ -495,6 +579,10 @@ class SBSPipeline:
             "sgbm_path_counts": path_counts,
             "calib_points": [(round(s, 2), round(t, 2)) for s, t in self._solver.calib_points],
             "suggested_disp_scales": suggested_scales,
+            # 新增字段
+            "roi_mode": last.get("roi_mode", "dual_detect"),
+            "avg_disp_px": last.get("avg_disp_px", 0.0),
+            "right_compute_roi_size": last.get("right_compute_roi_size"),
         }
 
     def calibrate_depth(self, sensor_z_cm: float, true_z_cm: float) -> dict:

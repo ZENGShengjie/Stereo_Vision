@@ -283,6 +283,65 @@ class CupDetector:
         return max(scored, key=lambda s: s[0])[1]
 
     @staticmethod
+    def select_target(
+        boxes: list[tuple[int, int, int, int, float]],
+        img_height: int,
+        img_width: int,
+    ) -> tuple[int, int, int, int] | None:
+        """综合打分制选框 - 优先选中画面内最近的目标。
+
+        打分公式:
+            score = 0.5 * (y2 / img_height) + 0.3 * (box_area / img_area) + 0.2 * confidence
+
+        其中:
+            - y2 / img_height: 框下边缘位置权重，越靠画面下方分数越高(对应目标越近)
+            - box_area / img_area: 框面积权重，面积越大分数越高
+            - confidence: 检测置信度权重
+
+        Args:
+            boxes: 检测候选框列表，每个元素为 (x1, y1, x2, y2, confidence)
+            img_height: 图像高度(像素)
+            img_width: 图像宽度(像素)
+
+        Returns:
+            分数最高的框 (x1, y1, x2, y2)，若无有效候选则返回 None
+        """
+        # 1. 空列表直接返回 None
+        if not boxes or len(boxes) == 0:
+            return None
+
+        # 2. 过滤无效框(宽高<=0、坐标越界)
+        img_area = float(img_height * img_width)
+        valid_boxes = []
+        for box in boxes:
+            x1, y1, x2, y2, conf = box
+            if x2 <= x1 or y2 <= y1:
+                continue
+            if x1 < 0 or y1 < 0 or x2 > img_width or y2 > img_height:
+                continue
+            valid_boxes.append(box)
+
+        if not valid_boxes:
+            return None
+
+        # 3. 计算综合得分
+        best_box = None
+        best_score = -1.0
+        for box in valid_boxes:
+            x1, y1, x2, y2, conf = box
+            box_area = float((x2 - x1) * (y2 - y1))
+            score = (
+                0.5 * (y2 / float(img_height))
+                + 0.3 * (box_area / img_area)
+                + 0.2 * float(conf)
+            )
+            if score > best_score:
+                best_score = score
+                best_box = (int(x1), int(y1), int(x2), int(y2))
+
+        return best_box
+
+    @staticmethod
     def _fallback_heuristic_select(
         candidates: list[tuple[int, int, int, int]],
         img_h: int,

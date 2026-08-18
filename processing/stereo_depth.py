@@ -731,6 +731,22 @@ class StereoDepthSolver:
         with self._state_lock:
             self._last_d_median = d_median
         result = round(float(result_z), 1)
+        
+        # 距离合理性校验:超出预设工作范围则判定为无效值
+        if result < DEPTH_MIN_CM or result > DEPTH_MAX_CM:
+            _debug_log(
+                "processing/stereo_depth.py:read_depth_in_box",
+                "depth_out_of_range_rejected",
+                {
+                    "box": list(box),
+                    "z_returned": result,
+                    "depth_range": [DEPTH_MIN_CM, DEPTH_MAX_CM],
+                },
+                "JITTER",
+            )
+            self._last_d_median = None
+            return None
+        
         _debug_log(
             "processing/stereo_depth.py:read_depth_in_box",
             "SUCCESS z returned (histogram peak)",
@@ -910,7 +926,75 @@ class StereoDepthSolver:
             return list(self._calib_points)
 
 
-__all__ = ["StereoDepthSolver"]
+def map_right_compute_roi(
+    left_box: tuple[int, int, int, int],
+    min_disp: int,
+    num_disp: int,
+    img_width: int,
+    img_height: int,
+) -> tuple[int, int, int, int]:
+    """由左图检测框推导右图 SGBM 计算用 ROI（几何映射）。
+
+    核心映射公式:
+    - 竖直方向(y轴): 极线校正后左右图行严格对齐，直接复用左图 y 坐标，
+      上下各加 10px padding 兜底标定微小误差
+    - 水平方向(x轴): 按最大视差范围向左扩展，保证所有深度的目标对应点
+      都落在 ROI 内
+
+    :param left_box: 左图检测框 (lx1, ly1, lx2, ly2)
+    :param min_disp: SGBM 参数 minDisparity
+    :param num_disp: SGBM 参数 numDisparities
+    :param img_width: 右图图像宽度
+    :param img_height: 右图图像高度
+    :return: right_compute_roi (rx1, ry1, rx2, ry2)
+    """
+    lx1, ly1, lx2, ly2 = left_box
+
+    # 竖直方向: 复用左图 y 坐标，上下各加 10px padding
+    ry1 = max(0, ly1 - 10)
+    ry2 = min(img_height, ly2 + 10)
+
+    # 水平方向: 按最大视差范围向左扩展
+    # 目标在右图最靠左的位置 = 左图 x1 - 最大视差
+    # 目标在右图最靠右的位置 = 左图 x2 - 最小视差
+    rx1 = max(0, lx1 - (min_disp + num_disp))
+    rx2 = min(img_width, lx2 - min_disp)
+
+    return (rx1, ry1, rx2, ry2)
+
+
+def map_right_display_box(
+    left_box: tuple[int, int, int, int],
+    avg_disp: float,
+    img_width: int,
+    img_height: int,
+) -> tuple[int, int, int, int]:
+    """由左图检测框 + 当前帧平均视差，推导右图显示用示意框（仅用于前端绘制）。
+
+    映射公式:
+    - 竖直方向: 和左图检测框完全一致
+    - 水平方向: 整体向左平移平均视差，框的宽高与左图完全相同
+
+    :param left_box: 左图检测框 (lx1, ly1, lx2, ly2)
+    :param avg_disp: 当前帧目标主体平均视差（像素）
+    :param img_width: 右图图像宽度
+    :param img_height: 右图图像高度
+    :return: right_display_box (dx1, dy1, dx2, dy2)
+    """
+    lx1, ly1, lx2, ly2 = left_box
+
+    # 竖直方向: 和左图检测框完全一致
+    dy1 = ly1
+    dy2 = ly2
+
+    # 水平方向: 整体向左平移平均视差，框的宽高与左图完全相同
+    dx1 = max(0, int(lx1 - avg_disp))
+    dx2 = min(img_width, int(lx2 - avg_disp))
+
+    return (dx1, dy1, dx2, dy2)
+
+
+__all__ = ["StereoDepthSolver", "map_right_compute_roi", "map_right_display_box"]
 
 
 if __name__ == "__main__":
