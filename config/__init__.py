@@ -11,6 +11,12 @@ from pathlib import Path
 from .hardware import (  # noqa: F401  (re-export)
     BASELINE_CM,
     CALIB_NPZ_PATH,
+    CHARUCO_COLS,
+    CHARUCO_DICT,
+    CHARUCO_MARKER_MM,
+    CHARUCO_MIN_CORNERS,
+    CHARUCO_ROWS,
+    CHARUCO_SQUARE_MM,
     DANGER_CM,
     DANGER_FLASH_HZ,
     DEFAULT_CONF_THRESHOLD,

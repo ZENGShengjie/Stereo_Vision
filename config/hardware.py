@@ -161,6 +161,46 @@ CALIB_NPZ_PATH: Path = BASE_DIR / "config" / "calibration" / "calib.npz"
 """
 
 # ---------------------------------------------------------------------------
+# 3.1 ChArUco 标定板参数(必须用数显游标卡尺精确测量打印件)
+# ---------------------------------------------------------------------------
+# 这些字段是 2026-08-19 整合 calibration_pack 时引入的;默认值是 calibration_pack
+# 的示例值,打印板上墙后请用数显游标卡尺实测 CHARUCO_SQUARE_MM / CHARUCO_MARKER_MM
+# 再改这两个值——错了深度精度全错。
+#
+# CHARUCO_*_MM 字段依赖 cv2.aruco 模块,需要 ``opencv-contrib-python``;
+# 若只装了 ``opencv-python``,字段在 import 时会得到 None,
+# 调用方(主要是 scripts/calibrate_stereo.py)需要在启动期检测并报错退出。
+try:
+    CHARUCO_DICT = cv2.aruco.DICT_6X6_250
+except AttributeError:
+    # opencv-python 默认无 aruco 子模块;装 opencv-contrib-python 后才会解析到这行
+    CHARUCO_DICT = None  # type: ignore[assignment]
+
+CHARUCO_COLS: int = 7
+"""棋盘格内 ArUco 码的列数(不含边界)。"""
+
+CHARUCO_ROWS: int = 5
+"""棋盘格内 ArUco 码的行数。"""
+
+CHARUCO_SQUARE_MM: float = 40.57
+"""每个方格物理边长,mm。
+
+⚠️ 必须用数显游标卡尺精确测量打印件,然后改这个值。
+"""
+
+CHARUCO_MARKER_MM: float = 29.95
+"""每个 ArUco 码物理边长,mm。
+
+⚠️ 必须 < CHARUCO_SQUARE_MM(典型是 0.7~0.8 倍的 square)。
+"""
+
+CHARUCO_MIN_CORNERS: int = 5
+"""检测到少于该数量的 ChArUco 角点时丢弃该帧。
+
+采集时尽量让左右眼共见 ID ≥ 10(越多越好)。低于 5 时 stereoCalibrate 警告不足。
+"""
+
+# ---------------------------------------------------------------------------
 # 4. 目标检测
 # ---------------------------------------------------------------------------
 TARGET_CLS_ID: int = 41
@@ -510,6 +550,12 @@ __all__ = [
     "SBS_HEIGHT",
     "BASE_DIR",
     "CALIB_NPZ_PATH",
+    "CHARUCO_COLS",
+    "CHARUCO_DICT",
+    "CHARUCO_MARKER_MM",
+    "CHARUCO_MIN_CORNERS",
+    "CHARUCO_ROWS",
+    "CHARUCO_SQUARE_MM",
     "TARGET_CLS_ID",
     "TARGET_CLS_NAME",
     "DEFAULT_CONF_THRESHOLD",

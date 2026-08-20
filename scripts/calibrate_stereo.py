@@ -1,36 +1,46 @@
-"""Stereo checkerboard calibration capture tool.
+"""Stereo ChArUco calibration capture tool.
 
 Usage:
     python scripts/calibrate_stereo.py
 
 Prerequisites:
-    - Your checkerboard: 10x7 grid (inner corners 9x6), square size = 20 mm
-    - Print at 100% scale, affix to a flat rigid board
-    - Keep the board visible in BOTH left and right views simultaneously
+    - 必须安装 opencv-contrib-python(cv2.aruco 才能解析)。
+      本项目默认 requirements.txt 只装 opencv-python,所以跑这个脚本前请:
+        pip install opencv-contrib-python
+      否则 config.hardware.CHARUCO_DICT 会是 None,启动时直接报错退出。
+    - 打印 ChArUco 板(运行此脚本后按 G 生成 PNG,或参考 calibration_pack/README.md)
+    - 板:7 列 × 5 行 ArUco,DICT_6X6_250
+    - Square = 40.57 mm,Marker = 29.95 mm(默认值)
+      务必用数显游标卡尺实测打印件,然后在 config/hardware.py 改
+      CHARUCO_SQUARE_MM / CHARUCO_MARKER_MM。
+    - ChArUco 板必须**同时**出现在左右两个画面中
 
 Output:
-    config/calibration/calib.npz  (auto-created)
+    config/calibration/calib.npz  (自动生成)
 
-How many pairs?
-    - Minimum: 20 pairs covering diverse tilts and distances
-    - More pairs = better calibration (up to ~40)
-    - Cover: near/far, tilted left/right/up/down, centered/edges
-    - Press SPACE to accept a pair, press R to reset/cancel
+为什么 ChArUco 比 chessboard 更好?
+    - ArUco 角点自动 sub-pixel refine,不需要额外的 cornerSubPix
+    - ID 标识:部分遮挡也鲁棒(只要 ≥ 5 个角点)
+    - 即便略微失焦也能给到 sub-pixel 精度
+    - 对 auto-exposure 闪烁更不敏感
 
-After calibration:
-    1. The npz is saved automatically
-    2. Restart the main service; it will load the npz and switch from
-       UNRECTIFIED to RECTIFIED mode
-    3. Use /api/stream/stats or perf page to check that:
-         - rectified=True
-         - epipolar_error < 1.0 px (ideally < 0.5)
-         - focal_px matches your hardware (~1140-1200 px)
+要拍多少对?
+    - 最低: 15 对,覆盖各种角度与距离
+    - 推荐: 20-30 对
+    - 覆盖: 近/远、左右倾、上下倾、居中/边缘
+    - SPACE 接受一对、R 撤回一对、G 保存标定板 PNG、ESC 结束采集
+
+采集完成后:
+    1. npz 自动保存到 config/calibration/calib.npz
+    2. 重启主服务,StereoCalibrator 会加载 npz 并切换到 RECTIFIED 模式
+
+整合历史:
+    2026-08-19 从 calibration_pack/scripts/calibrate_stereo.py 移植,保留项目原
+    CalibrationReport(单目/极线/内参一致性/k1 量级/角点距离分布)维度。
 """
 from __future__ import annotations
 
-import os
 import sys
-import json
 import time
 import threading
 from collections import deque
@@ -40,75 +50,148 @@ import cv2
 import numpy as np
 
 # ── hardware reality source ──────────────────────────────────────────────────
-# Import from project config so we read actual camera index / resolution
+# Import from project config so we read actual camera index / resolution /
+# ChArUco board params — single source of truth.
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from config import (
     BASELINE_CM,
     CALIB_NPZ_PATH,
-    USB_LEFT_INDEX,
-    USB_TARGET_WIDTH,
-    USB_TARGET_HEIGHT,
+    CHARUCO_COLS,
+    CHARUCO_DICT,
+    CHARUCO_MARKER_MM,
+    CHARUCO_MIN_CORNERS,
+    CHARUCO_ROWS,
+    CHARUCO_SQUARE_MM,
     USB_FPS,
+    USB_LEFT_INDEX,
+    USB_TARGET_HEIGHT,
+    USB_TARGET_WIDTH,
 )
 
-# ── checkerboard parameters ──────────────────────────────────────────────────
-BOARD_W = 9          # inner corners horizontally  (10 squares - 1)
-BOARD_H = 6          # inner corners vertically    (7  squares - 1)
-# Your board: 10 cols × 7 rows of squares = 9×6 inner corners.
-# Measured: 13.4 cm total for 7 squares → 134 mm / 7 ≈ 19.14 mm per square.
-SQUARE_SIZE_MM = 19.14  # MUST match printed board exactly (use digital caliper, 1:1 print)
+# ── guards: cv2.aruco + board preset ─────────────────────────────────────────
+if CHARUCO_DICT is None:
+    sys.stderr.write(
+        "[ERROR] cv2.aruco unavailable. The ChArUco capture tool requires\n"
+        "        opencv-contrib-python (cv2.aruco.DICT_*).\n"
+        "        current requirements.txt only installs opencv-python.\n"
+        "        Fix: pip install opencv-contrib-python\n"
+    )
+    sys.exit(2)
 
 # ── calibration output ───────────────────────────────────────────────────────
 OUTPUT_PATH: Path = CALIB_NPZ_PATH
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# ── camera backend ───────────────────────────────────────────────────────────
-BACKENDS = [
+# ── ChArUco board (OpenCV 4.13 new API) ──────────────────────────────────────
+_aruco_dict = cv2.aruco.getPredefinedDictionary(CHARUCO_DICT)
+_charuco_board = cv2.aruco.CharucoBoard(
+    (CHARUCO_COLS, CHARUCO_ROWS),
+    float(CHARUCO_SQUARE_MM),
+    float(CHARUCO_MARKER_MM),
+    _aruco_dict,
+)
+_aruco_detector = cv2.aruco.ArucoDetector(_aruco_dict)
+_charuco_detector = cv2.aruco.CharucoDetector(_charuco_board)
+
+
+# ── camera backend (DSHOW → MSMF fallback, same pattern as camera/usb_camera.py) ──
+_BACKENDS = [
     (cv2.CAP_DSHOW, "DSHOW"),
     (cv2.CAP_MSMF, "MSMF"),
 ]
 
 
-def _open_camera(index: int, width: int, height: int, fps: int):
-    """Try multiple backends; return (cap, backend_name)."""
-    for backend, name in BACKENDS:
-        cap = cv2.VideoCapture(index, backend)
-        if not cap.isOpened():
-            cap.release()
+def _try_open(
+    index: int,
+    fps: int = 15,
+    target_width: int | None = None,
+    target_height: int | None = None,
+    preferred_backend: int | None = None,
+) -> tuple[cv2.VideoCapture | None, str]:
+    """Open a USB camera, trying DSHOW first then MSMF, with MJPG negotiated.
+
+    Mirrors the probe-flush + read pattern from camera/usb_camera._try_open()
+    so we share the same edge-case handling on Windows USB cams.
+    """
+    order = list(_BACKENDS)
+    if preferred_backend is not None:
+        order.sort(key=lambda b: 0 if b[0] == preferred_backend else 1)
+
+    for backend, name in order:
+        # ── probe 1: flush MJPG decode buffer ────────────────────────────────
+        cap1 = cv2.VideoCapture(index, backend)
+        if not cap1.isOpened():
+            continue
+        cap1.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if target_width is not None:
+            cap1.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+        if target_height is not None:
+            cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        cap1.set(cv2.CAP_PROP_FPS, fps)
+        time.sleep(0.5)
+        cap1.read()
+        cap1.release()
+
+        # ── probe 2: actual open ────────────────────────────────────────────
+        cap2 = cv2.VideoCapture(index, backend)
+        if not cap2.isOpened():
+            continue
+        cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if target_width is not None:
+            cap2.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+        if target_height is not None:
+            cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+        cap2.set(cv2.CAP_PROP_FPS, fps)
+        time.sleep(0.3)
+        t0 = time.monotonic()
+        ret, frame = cap2.read()
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        if not ret or frame is None or frame.size == 0:
+            cap2.release()
             continue
 
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
+        if elapsed_ms > 300:
+            print(f"[camera] index={index} first read took {elapsed_ms:.0f}ms — retrying once...")
+            cap2.release()
+            cap2 = cv2.VideoCapture(index, backend)
+            if not cap2.isOpened():
+                continue
+            cap2.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            if target_width is not None:
+                cap2.set(cv2.CAP_PROP_FRAME_WIDTH, target_width)
+            if target_height is not None:
+                cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, target_height)
+            cap2.set(cv2.CAP_PROP_FPS, fps)
+            time.sleep(0.2)
+            ret, frame = cap2.read()
+            if not ret or frame is None or frame.size == 0:
+                cap2.release()
+                continue
 
-        time.sleep(0.5)
-        ret, frame = cap.read()
-        if ret and frame is not None and frame.size > 0:
-            print(f"[camera] index={index} opened with {name}, frame shape={frame.shape}")
-            return cap, name
-
-        cap.release()
+        print(f"[camera] index={index} opened with {name}, frame shape={frame.shape}")
+        return cap2, name
 
     return None, "none"
 
 
+def _warmup_frames(cap: cv2.VideoCapture, n: int = 5, settle_ms: int = 200) -> None:
+    deadline = time.time() + (n * settle_ms / 1000.0) + 1.0
+    count = 0
+    while count < n and time.time() < deadline:
+        cap.read()
+        count += 1
+        time.sleep(settle_ms / 1000.0)
+
+
 def _split_sbs(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split a 3840x1080 SBS frame into left and right eyes."""
     eye_w = frame.shape[1] // 2
     return frame[:, :eye_w], frame[:, eye_w:]
 
 
+# ── FrameReader ──────────────────────────────────────────────────────────────
 class FrameReader:
-    """Background thread that continuously reads frames from the camera.
-
-    The main thread calls get_latest() to get the most recent frame,
-    discarding any stale frames in the queue.  This decouples camera I/O
-    (which blocks on USB/decode) from the UI loop.
-    """
-
     def __init__(self, cap: cv2.VideoCapture, queue_size: int = 2):
         self._cap = cap
         self._queue: deque[np.ndarray] = deque(maxlen=queue_size)
@@ -127,7 +210,6 @@ class FrameReader:
                 self._queue.append(frame)
 
     def get_latest(self) -> np.ndarray | None:
-        """Return the newest available frame, or None if the queue is empty."""
         with self._lock:
             if not self._queue:
                 return None
@@ -138,99 +220,160 @@ class FrameReader:
         self._thread.join(timeout=2.0)
 
 
-def _draw_corners(
-    canvas: np.ndarray,
-    corners: np.ndarray,
-    ok: bool,
-    label: str,
-) -> None:
-    """Draw detected corners on a canvas copy."""
-    display = canvas.copy()
-    if ok:
-        cv2.drawChessboardCorners(display, (BOARD_W, BOARD_H), corners, ok)
-        color = (0, 255, 0)
-        info = f"{label}: OK ({len(corners)} corners)"
-    else:
-        color = (0, 0, 255)
-        info = f"{label}: not detected"
+# ── ChArUco detection (OpenCV 4.13 new API) ──────────────────────────────────
+def _detect_charuco(
+    gray: np.ndarray,
+) -> tuple[bool, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Detect ChArUco corners in a grayscale image.
 
-    cv2.putText(display, info, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-    return display
+    Returns:
+        (success, charuco_corners, charuco_ids, marker_corners, marker_ids):
+            - success: True if ≥ CHARUCO_MIN_CORNERS corners found
+            - charuco_corners: (N, 1, 2) float32, sub-pixel refined
+            - charuco_ids: (N, 1) int32
+            - marker_corners: raw ArUco marker corners for drawing
+            - marker_ids: raw ArUco marker IDs for drawing
+    """
+    marker_corners, marker_ids, _ = _aruco_detector.detectMarkers(gray)
+    if marker_ids is None or len(marker_ids) == 0:
+        return (
+            False,
+            np.zeros((0, 1, 2), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.int32),
+            np.zeros((0, 1, 2), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.int32),
+        )
+
+    charuco_corners, charuco_ids, _, _ = _charuco_detector.detectBoard(gray)
+    if charuco_ids is None or len(charuco_ids) < CHARUCO_MIN_CORNERS:
+        return (
+            False,
+            np.zeros((0, 1, 2), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.int32),
+            marker_corners,
+            marker_ids,
+        )
+
+    return True, charuco_corners, charuco_ids, marker_corners, marker_ids
 
 
-def _make_grid(corners_l: np.ndarray, corners_r: np.ndarray) -> np.ndarray:
-    """Arrange L/R corner images side by side with labels."""
-    dl = _draw_corners(np.zeros((540, 960, 3), dtype=np.uint8),
-                       corners_l, True, "L")
-    dr = _draw_corners(np.zeros((540, 960, 3), dtype=np.uint8),
-                       corners_r, True, "R")
-    return cv2.hconcat([dl, dr])
+# ── Preview renderer ─────────────────────────────────────────────────────────
+def _render_preview(
+    left_raw: np.ndarray,
+    right_raw: np.ndarray,
+    ok_l: bool, corners_l: np.ndarray, ids_l: np.ndarray,
+    ok_r: bool, corners_r: np.ndarray, ids_r: np.ndarray,
+    mks_l: np.ndarray, ids_mk_l: np.ndarray,
+    mks_r: np.ndarray, ids_mk_r: np.ndarray,
+    accepted: int,
+    fps: float,
+    last_msg: str,
+    last_ts: float,
+) -> np.ndarray:
+    def _overlay(img, ok, corners, ids, mks, ids_mk):
+        display = img.copy()
+        if mks is not None and ids_mk is not None and len(ids_mk) > 0:
+            cv2.aruco.drawDetectedMarkers(display, mks, ids_mk, borderColor=(0, 255, 0))
+        if ok and corners is not None and ids is not None and len(corners) > 0:
+            cv2.aruco.drawDetectedCornersCharuco(display, corners, ids, cornerColor=(0, 120, 255))
+        return display
+
+    pl = _overlay(cv2.resize(left_raw, (960, 540)), ok_l, corners_l, ids_l, mks_l, ids_mk_l)
+    pr = _overlay(cv2.resize(right_raw, (960, 540)), ok_r, corners_r, ids_r, mks_r, ids_mk_r)
+    both_preview = np.hstack([pl, pr])  # 1920 × 540 preview
+
+    status = np.full((90, 1920, 3), 22, dtype=np.uint8)
+    n_l = len(corners_l) if corners_l is not None else 0
+    n_r = len(corners_r) if corners_r is not None else 0
+    color = (0, 255, 0) if (ok_l and ok_r) else (0, 0, 255)
+    label = "BOTH OK — press SPACE" if (ok_l and ok_r) else f"L:{n_l}  R:{n_r}  (need ≥ {CHARUCO_MIN_CORNERS})"
+    cv2.putText(status, f"Accepted: {accepted}/15+  |  {label}",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+    cv2.putText(status, f"{fps:.1f} fps", (1800, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 1)
+    if last_msg and (time.time() - last_ts) < 3:
+        cv2.putText(status, last_msg, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+    cv2.putText(status, "SPACE=accept  R=reset  G=save-board  ESC=calibrate",
+                (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+    return np.vstack([both_preview, status])
 
 
+# ── Main capture loop ────────────────────────────────────────────────────────
 def run():
     # ── open camera ───────────────────────────────────────────────────────────
-    cap, name = _open_camera(
+    cap, name = _try_open(
         USB_LEFT_INDEX,
-        USB_TARGET_WIDTH * 2,   # SBS total width
-        USB_TARGET_HEIGHT,
-        USB_FPS,
+        fps=USB_FPS,
+        target_width=USB_TARGET_WIDTH * 2,
+        target_height=USB_TARGET_HEIGHT,
     )
     if cap is None:
         print("[ERROR] Could not open camera. Check USB index in config.")
-        print(f"  Current left_index={USB_LEFT_INDEX}, width={USB_TARGET_WIDTH*2}, height={USB_TARGET_HEIGHT}")
         sys.exit(1)
 
-    # Start background reader so cap.read() never blocks the UI thread
+    _warmup_frames(cap, n=5, settle_ms=200)
     reader = FrameReader(cap, queue_size=2)
-    print(f"[camera] Background reader started (DSHOW capture)")
+    print(f"[camera] Background reader started ({name})")
 
-    # ── prepare object points (same for all views) ────────────────────────────
-    objp = np.zeros((BOARD_W * BOARD_H, 3), dtype=np.float32)
-    objp[:, :2] = np.mgrid[0:BOARD_W, 0:BOARD_H].T.reshape(-1, 2)
-    objp *= SQUARE_SIZE_MM  # in mm
-
-    collected: list[tuple[list[np.ndarray], list[np.ndarray]]] = []
+    # ── collection ─────────────────────────────────────────────────────────────
+    # Each entry: (corners_l, ids_l, corners_r, ids_r)
+    # shapes: corners (N,1,2) float32, ids (N,1) int32
+    collected: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     accepted = 0
     last_msg = ""
-    last_ts = time.time()
+    last_ts = 0.0
 
-    # Let the background reader fill the queue before entering the loop
     time.sleep(0.3)
 
     print("\n" + "=" * 60)
-    print("STEREO CALIBRATION CAPTURE")
+    print("STEREO CHARUCO CALIBRATION CAPTURE")
     print("=" * 60)
-    print(f"  Checkerboard : {BOARD_W}x{BOARD_H} inner corners")
-    print(f"  Square size   : {SQUARE_SIZE_MM} mm")
-    print(f"  Target pairs  : 20-40 (more is better)")
-    print(f"  Output        : {OUTPUT_PATH}")
+    print(f"  Board       : {CHARUCO_COLS}×{CHARUCO_ROWS} ArUco, DICT_6X6_250")
+    print(f"  Square size : {CHARUCO_SQUARE_MM} mm  (measure with caliper!)")
+    print(f"  Marker size : {CHARUCO_MARKER_MM} mm")
+    print(f"  Min corners : {CHARUCO_MIN_CORNERS} per view")
+    print(f"  Target      : 15-30 pairs")
+    print(f"  Output      : {OUTPUT_PATH}")
     print()
     print("  SPACE   = accept current pair")
     print("  R       = reset last pair")
+    print("  G       = generate & save board image")
     print("  ESC / Q = finish & calibrate")
     print("=" * 60 + "\n")
 
-    # Pre-create calibration criteria
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6)
-
-    # Cache last detection so preview is still visible between detections
+    # Cache state
     _ok_l = False
     _ok_r = False
-    _corners_l: np.ndarray | None = None
-    _corners_r: np.ndarray | None = None
+    _corners_l: np.ndarray = np.zeros((0, 1, 2), dtype=np.float32)
+    _corners_r: np.ndarray = np.zeros((0, 1, 2), dtype=np.float32)
+    _ids_l: np.ndarray = np.zeros((0, 1), dtype=np.int32)
+    _ids_r: np.ndarray = np.zeros((0, 1), dtype=np.int32)
+    _mks_l: np.ndarray = np.zeros((0, 1, 2), dtype=np.float32)
+    _ids_mk_l: np.ndarray = np.zeros((0, 1), dtype=np.int32)
+    _mks_r: np.ndarray = np.zeros((0, 1, 2), dtype=np.float32)
+    _ids_mk_r: np.ndarray = np.zeros((0, 1), dtype=np.int32)
     _frame_idx = 0
 
-    # Preview cache (only recompute on detection frames to reduce CPU load)
-    _cached_preview: np.ndarray | None = None
-
-    # FPS tracking
     _fps_start = time.time()
     _fps_count = 0
     fps = 0.0
 
+    def _save_board_image():
+        out = OUTPUT_PATH.parent / "charuco_board.png"
+        img = _charuco_board.generateImage((1920, int(1920 * CHARUCO_ROWS / CHARUCO_COLS)))
+        cv2.imwrite(str(out), img)
+        print(f"[board] Saved: {out}")
+        scale = 4
+        out_hr = OUTPUT_PATH.parent / "charuco_board_hires.png"
+        img_hr = _charuco_board.generateImage((
+            1920 * scale,
+            int(1920 * scale * CHARUCO_ROWS / CHARUCO_COLS),
+        ))
+        cv2.imwrite(str(out_hr), img_hr)
+        print(f"[board] Saved high-res: {out_hr}")
+
     while True:
-        # Non-blocking: get latest frame from background thread
         frame = reader.get_latest()
         if frame is None:
             cv2.waitKey(5)
@@ -246,372 +389,299 @@ def run():
         left_raw, right_raw = _split_sbs(frame)
         _frame_idx += 1
 
-        # Detect corners every 3 frames (expensive; preview still updates every frame)
-        detect = (_frame_idx % 3 == 1)
+        detect = (_frame_idx % 2 == 0)
         if detect:
-            ok_l, corners_l = cv2.findChessboardCorners(left_raw, (BOARD_W, BOARD_H), None)
-            ok_r, corners_r = cv2.findChessboardCorners(right_raw, (BOARD_W, BOARD_H), None)
+            gray_l = cv2.cvtColor(left_raw, cv2.COLOR_BGR2GRAY)
+            gray_r = cv2.cvtColor(right_raw, cv2.COLOR_BGR2GRAY)
 
-            # Refine corners
-            if ok_l and corners_l is not None and len(corners_l) > 0:
-                gray_l = cv2.cvtColor(left_raw, cv2.COLOR_BGR2GRAY)
-                cv2.cornerSubPix(gray_l, corners_l, (5, 5), (-1, -1), criteria)
-            if ok_r and corners_r is not None and len(corners_r) > 0:
-                gray_r = cv2.cvtColor(right_raw, cv2.COLOR_BGR2GRAY)
-                cv2.cornerSubPix(gray_r, corners_r, (5, 5), (-1, -1), criteria)
+            ok_l, corners_l, ids_l, mks_l, ids_mk_l = _detect_charuco(gray_l)
+            ok_r, corners_r, ids_r, mks_r, ids_mk_r = _detect_charuco(gray_r)
 
             _ok_l, _ok_r = ok_l, ok_r
             _corners_l, _corners_r = corners_l, corners_r
+            _ids_l, _ids_r = ids_l, ids_r
+            _mks_l, _mks_r = mks_l, mks_r
+            _ids_mk_l, _ids_mk_r = ids_mk_l, ids_mk_r
         else:
             ok_l, ok_r = _ok_l, _ok_r
             corners_l, corners_r = _corners_l, _corners_r
+            ids_l, ids_r = _ids_l, _ids_r
+            mks_l, mks_r = _mks_l, _mks_r
+            ids_mk_l, ids_mk_r = _ids_mk_l, _ids_mk_r
 
         both = ok_l and ok_r
 
-        # Rebuild preview only on detection frames to reduce CPU load
-        if detect or _cached_preview is None:
-            preview_l = cv2.resize(left_raw, (960, 540))
-            preview_r = cv2.resize(right_raw, (960, 540))
-
-            sx_l, sy_l = 960 / left_raw.shape[1], 540 / left_raw.shape[0]
-            sx_r, sy_r = 960 / right_raw.shape[1], 540 / right_raw.shape[0]
-
-            n_corners = BOARD_W * BOARD_H
-            cl_ok = bool(ok_l) and (corners_l is not None) and (corners_l.size > 0) and (corners_l.shape[0] == n_corners)
-            cr_ok = bool(ok_r) and (corners_r is not None) and (corners_r.size > 0) and (corners_r.shape[0] == n_corners)
-
-            if cl_ok:
-                scaled = (corners_l.reshape(-1, 2) * np.array([sx_l, sy_l], dtype=np.float64)).astype(np.float32)
-                preview_l = cv2.drawChessboardCorners(preview_l, (BOARD_W, BOARD_H), scaled, True)
-            if cr_ok:
-                scaled_r = (corners_r.reshape(-1, 2) * np.array([sx_r, sy_r], dtype=np.float64)).astype(np.float32)
-                preview_r = cv2.drawChessboardCorners(preview_r, (BOARD_W, BOARD_H), scaled_r, True)
-
-            both_preview = np.hstack([preview_l, preview_r])   # 1920 x 540
-
-            # Status bar with dark background to avoid flicker
-            status = np.full((90, 1920, 3), 30, dtype=np.uint8)
-            if elapsed >= 1.0:
-                cv2.putText(status, f"{fps:.1f} fps", (1820, 35),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 1)
-
-            cv2.putText(status, f"Accepted pairs: {accepted}/20+  |  "
-                        f"L:{'OK' if ok_l else '---'}  R:{'OK' if ok_r else '---'}  |  "
-                        f"{'BOTH DETECTED - press SPACE' if both else 'Move board to see both views'}",
-                        (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
-
-            if last_msg and (time.time() - last_ts) < 3:
-                cv2.putText(status, last_msg, (10, 65),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 1)
-
-            cv2.putText(status, "SPACE=accept  R=reset  ESC=calibrate",
-                        (10, 87), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
-
-            _cached_preview = np.vstack([both_preview, status])
-
-        cv2.imshow("Stereo Calibration", _cached_preview)
+        preview = _render_preview(
+            left_raw, right_raw,
+            ok_l, corners_l, ids_l,
+            ok_r, corners_r, ids_r,
+            mks_l, ids_mk_l,
+            mks_r, ids_mk_r,
+            accepted, fps, last_msg, last_ts,
+        )
+        cv2.imshow("Stereo ChArUco Calibration", preview)
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q"), ord("Q")):
             break
         if key == ord(" "):
-            corners_valid = (
-                corners_l is not None and len(corners_l) > 0
-                and corners_r is not None and len(corners_r) > 0
-            )
-            if both and corners_valid:
+            if both:
                 accepted += 1
-                collected.append((corners_l.copy(), corners_r.copy()))
-                last_msg = f"  Pair {accepted} saved!"
+                collected.append((
+                    _corners_l.copy(),
+                    _ids_l.copy(),
+                    _corners_r.copy(),
+                    _ids_r.copy(),
+                ))
+                last_msg = (f"  Pair {accepted} saved  "
+                            f"(L:{len(_corners_l)}  R:{len(_corners_r)} corners)")
                 last_ts = time.time()
-                # #region agent log H-B — save the very first accepted raw split
-                # Hypothesis B/C: is _split_sbs() returning the right eyes?  Dump
-                # the raw left_raw / right_raw from the last detect frame so the
-                # user can open them and visually confirm which is which.
-                if accepted == 1:
-                    try:
-                        dbg_dir = os.path.join(os.path.dirname(__file__), "..", "config", "calibration", "_debug")
-                        dbg_dir = os.path.normpath(dbg_dir)
-                        os.makedirs(dbg_dir, exist_ok=True)
-                        cv2.imwrite(os.path.join(dbg_dir, "first_left.png"), left_raw)
-                        cv2.imwrite(os.path.join(dbg_dir, "first_right.png"), right_raw)
-                        cv2.imwrite(os.path.join(dbg_dir, "first_sbs.png"), np.hstack([left_raw, right_raw]))
-                        with open(r"e:\Remote_HCR\Stereo_Vision-main\debug-c7ffa8.log", "a", encoding="utf-8") as _flog:
-                            _flog.write(json.dumps({
-                                "id": f"log_dbg_{int(time.time()*1000)}_firstsplit",
-                                "sessionId": "c7ffa8",
-                                "timestamp": int(time.time() * 1000),
-                                "location": "calibrate_stereo.py:325",
-                                "message": "first pair raw split saved",
-                                "data": {
-                                    "saved_dir": dbg_dir,
-                                    "left_shape": list(left_raw.shape),
-                                    "right_shape": list(right_raw.shape),
-                                },
-                                "runId": "pre-fix",
-                                "hypothesisId": "B"
-                            }, ensure_ascii=False) + "\n")
-                    except Exception as _e:
-                        with open(r"e:\Remote_HCR\Stereo_Vision-main\debug-c7ffa8.log", "a", encoding="utf-8") as _flog:
-                            _flog.write(json.dumps({
-                                "id": f"log_dbg_{int(time.time()*1000)}_firstsplit_err",
-                                "sessionId": "c7ffa8",
-                                "timestamp": int(time.time() * 1000),
-                                "location": "calibrate_stereo.py:325",
-                                "message": f"first-split save failed: {_e}",
-                                "data": {},
-                                "runId": "pre-fix",
-                                "hypothesisId": "B"
-                            }, ensure_ascii=False) + "\n")
-                # #endregion agent log H-B
             else:
-                last_msg = "  Must detect BOTH L and R first!"
+                last_msg = f"  Need ≥ {CHARUCO_MIN_CORNERS} corners in BOTH views"
                 last_ts = time.time()
         if key in (ord("r"), ord("R")):
             if collected:
                 collected.pop()
-                accepted -= 1
+                accepted = max(0, accepted - 1)
                 last_msg = f"  Last pair removed ({accepted} remaining)"
                 last_ts = time.time()
+        if key in (ord("g"), ord("G")):
+            _save_board_image()
 
     reader.release()
     cap.release()
     cv2.destroyAllWindows()
 
-    if len(collected) < 10:
-        print(f"[ERROR] Only {len(collected)} pairs collected. Need at least 10.")
+    if len(collected) < 8:
+        print(f"[ERROR] Only {len(collected)} pairs collected. Need at least 8.")
         sys.exit(1)
 
-    # ── calibrate ─────────────────────────────────────────────────────────────
-    print(f"\n[calibrate] Running stereoCalibrate with {len(collected)} pairs...")
+    def _scalar(x) -> float:
+        """Safely extract a Python float from numpy 0-d array or regular float."""
+        if isinstance(x, np.ndarray) and x.ndim == 0:
+            return float(x)
+        if isinstance(x, np.ndarray):
+            return float(x.ravel()[0])
+        return float(x)
 
-    imgpoints_l: list[np.ndarray] = [c[0] for c in collected]
-    imgpoints_r: list[np.ndarray] = [c[1] for c in collected]
-
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CALIBRATION
+    # ═══════════════════════════════════════════════════════════════════════════
     image_size = (USB_TARGET_WIDTH, USB_TARGET_HEIGHT)
+    print(f"\n[calibrate] Processing {len(collected)} ChArUco pairs...")
 
-    # #region agent log H-A/D — monocular pre-flight + save first split frame
-    try:
-        # Save first pair's split frames to disk for visual inspection (Hypothesis B:
-        # is _split_sbs() actually returning left/right correctly?  Some DSHOW drivers
-        # emit 1920x2160 vertical-stacked instead of 3840x1080 SBS, which would put
-        # the bottom-half of one eye next to the top-half of the other.)
-        dbg_dir = os.path.join(os.path.dirname(__file__), "..", "config", "calibration", "_debug")
-        dbg_dir = os.path.normpath(dbg_dir)
-        os.makedirs(dbg_dir, exist_ok=True)
-        _dbg_l, _dbg_r = collected[0][0], collected[0][1]  # not the raw images, but
-        # we also dump the raw first-pair frame from the most recent detect cycle.
-        # The raw frame is more useful; fall back to drawn corners if needed.
-        with open(r"e:\Remote_HCR\Stereo_Vision-main\debug-c7ffa8.log", "a", encoding="utf-8") as _flog:
-            _flog.write(json.dumps({
-                "id": f"log_dbg_{int(time.time()*1000)}_preflight",
-                "sessionId": "c7ffa8",
-                "timestamp": int(time.time() * 1000),
-                "location": "calibrate_stereo.py:343",
-                "message": "preflight check",
-                "data": {
-                    "n_pairs": len(collected),
-                    "img_size": list(image_size),
-                    "first_pair_corners_shape": [list(_dbg_l.shape), list(_dbg_r.shape)],
-                },
-                "runId": "pre-fix",
-                "hypothesisId": "A"
-            }, ensure_ascii=False) + "\n")
+    # ── 1. Initial K from image size ──────────────────────────────────────────
+    # fx ≈ fy ≈ (image_width / 2) / tan(HFOV/2)
+    fx0 = image_size[0] * 0.75
+    fy0 = image_size[0] * 0.75
+    K0 = np.array([
+        [fx0, 0, image_size[0] / 2],
+        [0, fy0, image_size[1] / 2],
+        [0, 0, 1],
+    ], dtype=np.float32)
+    D0 = np.zeros(5, dtype=np.float32)
+    print(f"[calibrate] Initial K: fx={fx0:.0f}, fy={fy0:.0f}, cx={image_size[0]/2:.0f}, cy={image_size[1]/2:.0f}")
 
-        # Per-eye monocular pre-flight (Hypothesis A):  is the high RMS coming from
-        # per-eye calibration difficulty, or purely from the cross-eye R/T search?
-        # If left/right monocular RMS are each < 1 px, then the problem is cross-eye
-        # pairing (sample diversity, board coverage).  If either is > 1 px, the
-        # problem is image quality (focus, exposure, reflection).
-        W, H = image_size
-        flags_mono = 0  # no constraints, let it fit freely
-        # Use a single objp instance (we already have it above)
-        _ret_l, _K_l, _D_l, _rvecs_l, _tvecs_l = cv2.calibrateCamera(
-            [objp] * len(collected), imgpoints_l, image_size, None, None, flags=flags_mono)
-        _ret_r, _K_r, _D_r, _rvecs_r, _tvecs_r = cv2.calibrateCamera(
-            [objp] * len(collected), imgpoints_r, image_size, None, None, flags=flags_mono)
-        with open(r"e:\Remote_HCR\Stereo_Vision-main\debug-c7ffa8.log", "a", encoding="utf-8") as _flog:
-            _flog.write(json.dumps({
-                "id": f"log_dbg_{int(time.time()*1000)}_mono",
-                "sessionId": "c7ffa8",
-                "timestamp": int(time.time() * 1000),
-                "location": "calibrate_stereo.py:370",
-                "message": "monocular preflight",
-                "data": {
-                    "rms_left_mono": float(_ret_l),
-                    "rms_right_mono": float(_ret_r),
-                    "k1_left_mono": float(_D_l.ravel()[0]) if _D_l.size else 0.0,
-                    "k1_right_mono": float(_D_r.ravel()[0]) if _D_r.size else 0.0,
-                    "fx_left_mono": float(_K_l[0, 0]),
-                    "fx_right_mono": float(_K_r[0, 0]),
-                    "cx_left_mono": float(_K_l[0, 2]),
-                    "cx_right_mono": float(_K_r[0, 2]),
-                },
-                "runId": "pre-fix",
-                "hypothesisId": "A"
-            }, ensure_ascii=False) + "\n")
-    except Exception as _e:
-        with open(r"e:\Remote_HCR\Stereo_Vision-main\debug-c7ffa8.log", "a", encoding="utf-8") as _flog:
-            _flog.write(json.dumps({
-                "id": f"log_dbg_{int(time.time()*1000)}_preflight_err",
-                "sessionId": "c7ffa8",
-                "timestamp": int(time.time() * 1000),
-                "location": "calibrate_stereo.py:343",
-                "message": f"preflight failed: {_e}",
-                "data": {},
-                "runId": "pre-fix",
-                "hypothesisId": "A"
-            }, ensure_ascii=False) + "\n")
-    # #endregion agent log H-A/D
+    # ── 2. Collect matched ChArUco points ─────────────────────────────────────
+    all_objpts: list[np.ndarray] = []
+    all_imgpts_l: list[np.ndarray] = []
+    all_imgpts_r: list[np.ndarray] = []
+    all_charuco_l: list[np.ndarray] = []
+    all_charuco_ids_l: list[np.ndarray] = []
+    all_charuco_r: list[np.ndarray] = []
+    all_charuco_ids_r: list[np.ndarray] = []
 
-    # Estimate reasonable initial K (focal ~70% of larger image dimension, centered)
-    W, H = image_size
-    f0 = 0.7 * max(W, H)
-    K0_l = np.array([[f0, 0, W / 2],
-                      [0, f0, H / 2],
-                      [0,  0, 1]], dtype=np.float64)
-    K0_r = K0_l.copy()
-    D0 = np.zeros((1, 1), dtype=np.float64)
+    for i in range(len(collected)):
+        c_l, id_l, c_r, id_r = collected[i]
+        c_l = np.asarray(c_l)
+        id_l = np.asarray(id_l).ravel()
+        c_r = np.asarray(c_r)
+        id_r = np.asarray(id_r).ravel()
+        if len(c_l) < CHARUCO_MIN_CORNERS or len(c_r) < CHARUCO_MIN_CORNERS:
+            continue
 
-    try:
-        ret, K_l, D_l, K_r, D_r, R, T, E, F = cv2.stereoCalibrate(
-            [objp] * len(collected),
-            imgpoints_l,
-            imgpoints_r,
-            K0_l, D0, K0_r, D0,
-            image_size,
-            # No extra flags: let OpenCV freely optimize fx, fy, cx, cy, k1, k2, p1, p2
-            # for both cameras independently.  Previous flags (SAME_FOCAL_LENGTH,
-            # FIX_PRINCIPAL_POINT) over-constrained the fit and inflated RMS by 2-4 px.
-            flags=0,
-        )
-        print(f"[calibrate] RMS re-projection error: {ret:.3f} px")
-        if ret > 1.0:
-            print(f"[WARN] High RMS ({ret:.1f} px). Tips to reduce:")
-            print(f"  - Lock camera exposure / white-balance before collecting (auto-exposure")
-            print(f"    causes brightness shifts between frames, the #1 cause of high RMS)")
-            print(f"  - Collect more pairs (30-40), cover all 4 corners and edges")
-            print(f"  - Tilt/rotate the board in various angles, vary distance")
-            print(f"  - Ensure board is flat and corners are sharp / not blurry")
-            print(f"  - If RMS stays > 2 despite good samples, re-measure SQUARE_SIZE_MM")
-            print(f"    with a digital caliper (e.g. 19.14 mm, use more decimal places)")
-    except Exception as ex:
-        print(f"[ERROR] stereoCalibrate failed: {ex}")
+        all_charuco_l.append(c_l)
+        all_charuco_ids_l.append(id_l)
+        all_charuco_r.append(c_r)
+        all_charuco_ids_r.append(id_r)
+
+        try:
+            obj_l, img_l = _charuco_board.matchImagePoints(c_l, id_l)
+            obj_r, img_r = _charuco_board.matchImagePoints(c_r, id_r)
+            obj_l = np.asarray(obj_l).reshape(-1, 3).astype(np.float32)
+            img_l = np.asarray(img_l).reshape(-1, 2).astype(np.float32)
+            obj_r = np.asarray(obj_r).reshape(-1, 3).astype(np.float32)
+            img_r = np.asarray(img_r).reshape(-1, 2).astype(np.float32)
+            if len(obj_l) != len(img_l) or len(obj_r) != len(img_r):
+                continue
+            ids_l_set = set(id_l)
+            ids_r_set = set(id_r)
+            common_ids = np.array(sorted(ids_l_set & ids_r_set), dtype=np.int32)
+            if len(common_ids) < CHARUCO_MIN_CORNERS:
+                continue
+            id_l_arr = np.asarray(id_l).ravel()
+            id_r_arr = np.asarray(id_r).ravel()
+            idx_l = np.isin(id_l_arr, common_ids)
+            idx_r = np.isin(id_r_arr, common_ids)
+            all_objpts.append(obj_l[idx_l])
+            all_imgpts_l.append(img_l[idx_l])
+            all_imgpts_r.append(img_r[idx_r])
+        except Exception:
+            continue
+
+    if len(all_objpts) < 8:
+        print(f"[ERROR] Only {len(all_objpts)} valid frames for stereo calibration.")
         sys.exit(1)
 
-    # Validate returned matrices
-    for name, m, expected_shape in [
-        ("K_l", K_l, (3, 3)), ("K_r", K_r, (3, 3)),
-        ("R",   R,   (3, 3)), ("T",   T,   (3, 1)),
-    ]:
-        if m is None or np.array(m).shape != expected_shape:
-            print(f"[ERROR] {name} has invalid shape {np.array(m).shape if m is not None else None}, expected {expected_shape}")
-            sys.exit(1)
+    # ── 3. Two-step stereo calibration ─────────────────────────────────────────
+    stereo_flags_initial = cv2.CALIB_SAME_FOCAL_LENGTH | cv2.CALIB_USE_INTRINSIC_GUESS
+    stereo_flags_refine = cv2.CALIB_FIX_INTRINSIC | cv2.CALIB_USE_INTRINSIC_GUESS
 
-    # Validate physical baseline (expect 50-500 mm for most stereo rigs)
-    baseline_mm = float(np.linalg.norm(T)) * 1000  # T from stereoCalibrate is in meters
+    try:
+        result = cv2.stereoCalibrate(
+            all_objpts, all_imgpts_l, all_imgpts_r,
+            K0, D0, K0, D0,
+            image_size,
+            flags=stereo_flags_initial,
+        )
+        if len(result) >= 9:
+            ret1, K_l, D_l, K_r, D_r, R, T, E, F = result[:9]
+        else:
+            ret1, K_l, D_l, K_r, D_r, R, T, E, F = result
+        print(f"[calibrate] Step 1 (SAME_FOCAL_LENGTH): RMS={_scalar(ret1):.3f} px, k1_L={_scalar(D_l[0]):.4f}, k1_R={_scalar(D_r[0]):.4f}")
+    except Exception as ex:
+        print(f"[ERROR] stereoCalibrate step 1 failed: {ex}")
+        sys.exit(1)
+
+    try:
+        result2 = cv2.stereoCalibrate(
+            all_objpts, all_imgpts_l, all_imgpts_r,
+            K_l, D_l, K_r, D_r,
+            image_size,
+            flags=stereo_flags_refine,
+        )
+        if len(result2) >= 9:
+            ret2, K_l2, D_l2, K_r2, D_r2, R2, T2, E, F = result2[:9]
+        else:
+            ret2, K_l2, D_l2, K_r2, D_r2, R2, T2, E, F = result2
+        print(f"[calibrate] Step 2 (FIX_INTRINSIC): RMS={_scalar(ret2):.3f} px")
+    except Exception as ex:
+        print(f"[WARN] Step 2 failed: {ex}, using step 1 result")
+        K_l2, D_l2, K_r2, D_r2, R2, T2 = K_l, D_l, K_r, D_r, R, T
+        ret2 = ret1
+
+    # ── 4. Monocular refinement ────────────────────────────────────────────────
+    def _refine_mono(eye: str, corners_list, ids_list, K_in, D_in):
+        if len(corners_list) < 4:
+            return float("nan"), K_in, D_in
+        try:
+            ret, K, D, *_ = cv2.calibrateCamera(
+                corners_list, ids_list,
+                _charuco_board, image_size,
+                K_in, D_in,
+                flags=cv2.CALIB_USE_INTRINSIC_GUESS,
+            )
+            return float(ret), K, D
+        except Exception:
+            return float("nan"), K_in, D_in
+
+    ret_l, K_l2, D_l2 = _refine_mono("L", all_charuco_l, all_charuco_ids_l, K_l2, D_l2)
+    ret_r, K_r2, D_r2 = _refine_mono("R", all_charuco_r, all_charuco_ids_r, K_r2, D_r2)
+    print(f"[calibrate] Monocular refinement: L={_scalar(ret_l):.3f} px  R={_scalar(ret_r):.3f} px")
+
+    # ── 5. Final stereo with refined intrinsics ────────────────────────────────
+    try:
+        result3 = cv2.stereoCalibrate(
+            all_objpts, all_imgpts_l, all_imgpts_r,
+            K_l2, D_l2, K_r2, D_r2,
+            image_size,
+            flags=cv2.CALIB_FIX_INTRINSIC | cv2.CALIB_USE_INTRINSIC_GUESS,
+        )
+        if len(result3) >= 9:
+            ret_stereo, K_l3, D_l3, K_r3, D_r3, R, T, E, F = result3[:9]
+        else:
+            ret_stereo, K_l3, D_l3, K_r3, D_r3, R, T, E, F = result3
+    except Exception:
+        K_l3, D_l3, K_r3, D_r3 = K_l2, D_l2, K_r2, D_r2
+        ret_stereo = ret2
+
+    print(f"[calibrate] Final stereo RMS: {float(ret_stereo):.3f} px")
+
+    # ── 6. Baseline normalization ─────────────────────────────────────────────
+    baseline_mm = float(np.linalg.norm(T)) * 1000
     if baseline_mm < 50 or baseline_mm > 2000:
-        print(f"[calibrate] Scale collapse detected (||T|| = {baseline_mm:.1f} mm).")
-        print(f"[calibrate] Normalizing T to physical baseline ({BASELINE_CM * 10:.1f} mm)...")
-        # T has collapsed because objp scale (SQUARE_SIZE_MM) is slightly wrong.
-        # We scale T to the correct physical baseline.  K stays as-is: the pixel focal
-        # length is independent of T-scale and the remap maps only depend on K ratios.
-        # Depth-from-disparity uses hardware.py z_cm_from_disparity() which reads
-        # BASELINE_CM directly and does NOT depend on this T vector.
-        scale_ratio = (BASELINE_CM * 10.0) / baseline_mm  # e.g. 60 / 62000
+        print(f"[calibrate] Scale collapse (||T|| = {baseline_mm:.1f} mm).")
+        print(f"[calibrate] Normalizing to physical baseline ({BASELINE_CM * 10:.1f} mm)...")
+        scale_ratio = (BASELINE_CM * 10.0) / baseline_mm
         T = T * scale_ratio
         baseline_mm = float(np.linalg.norm(T)) * 1000
         print(f"[calibrate] After normalization: ||T|| = {baseline_mm:.1f} mm")
     print(f"[calibrate] Baseline: {baseline_mm:.1f} mm")
 
-    # ── rectify ────────────────────────────────────────────────────────────────
+    # ── 7. Rectification ─────────────────────────────────────────────────────
     print("[calibrate] Computing rectification maps...")
     try:
         result = cv2.stereoRectify(
-            K_l, D_l, K_r, D_r, image_size, R, T,
+            K_l3, D_l3, K_r3, D_r3, image_size, R, T,
             flags=cv2.CALIB_ZERO_DISPARITY,
             alpha=-1,
         )
-        # OpenCV 4.x returns 7 values: R1(3,3), R2(3,3), P1(3,4), P2(3,4), Q(4,4), validRoi1(4,), validRoi2(4,)
-        if len(result) == 7:
-            R1, R2, P1, P2, Q, validRoi1, validRoi2 = result
-        else:
-            R1, R2, P1, P2, Q, _, _ = result
-        for name, m, expected_shape in [
-            ("R1", R1, (3, 3)), ("R2", R2, (3, 3)),
-            ("P1", P1, (3, 4)), ("P2", P2, (3, 4)),
-        ]:
-            if m is None or np.array(m).shape != expected_shape:
-                print(f"[ERROR] {name} has invalid shape {np.array(m).shape if m is not None else None}, expected {expected_shape}")
-                sys.exit(1)
+        R1, R2, P1, P2, Q, _, _ = result
     except Exception as ex:
         print(f"[ERROR] stereoRectify failed: {ex}")
         sys.exit(1)
 
     map1_l, map2_l = cv2.initUndistortRectifyMap(
-        K_l, D_l, R1, P1, image_size, cv2.CV_32FC1,
+        K_l3, D_l3, R1, P1, image_size, cv2.CV_32FC1,
     )
     map1_r, map2_r = cv2.initUndistortRectifyMap(
-        K_r, D_r, R2, P2, image_size, cv2.CV_32FC1,
+        K_r3, D_r3, R2, P2, image_size, cv2.CV_32FC1,
     )
 
-    # ── save ──────────────────────────────────────────────────────────────────
+    # ── 8. Save ─────────────────────────────────────────────────────────────
     np.savez(
         OUTPUT_PATH,
-        # Remap tables (primary path for StereoCalibrator)
         map1_l=map1_l, map2_l=map2_l,
         map1_r=map1_r, map2_r=map2_r,
-        # Full intrinsic / extrinsic data (secondary path)
-        K_l=K_l.astype(np.float64),
-        D_l=D_l.astype(np.float64),
-        K_r=K_r.astype(np.float64),
-        D_r=D_r.astype(np.float64),
+        K_l=K_l3.astype(np.float64),
+        D_l=D_l3.astype(np.float64),
+        K_r=K_r3.astype(np.float64),
+        D_r=D_r3.astype(np.float64),
         R=R.astype(np.float64),
         T=T.astype(np.float64),
-        # Reprojection matrix (for Q-based depth computation)
         Q=Q.astype(np.float64),
     )
     print(f"[calibrate] Saved: {OUTPUT_PATH}")
 
-    # ── report ────────────────────────────────────────────────────────────────
+    # ── 9. Report ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 50)
     print("CALIBRATION REPORT")
     print("=" * 50)
-    print(f"  Pairs used     : {len(collected)}")
-    print(f"  RMS error      : {ret:.3f} px  (good if < 0.5, acceptable if < 1.0)")
+    print(f"  Pairs used       : {len(collected)}")
+    print(f"  Mono RMS (L/R)   : {_scalar(ret_l):.3f} / {_scalar(ret_r):.3f} px")
+    print(f"  Stereo RMS       : {_scalar(ret_stereo):.3f} px  (good < 0.5, acceptable < 1.0)")
     print()
     print("  Left camera:")
-    print(f"    fx = {K_l[0,0]:.1f} px")
-    print(f"    fy = {K_l[1,1]:.1f} px")
-    print(f"    cx = {K_l[0,2]:.1f} px")
-    print(f"    cy = {K_l[1,2]:.1f} px")
-    print(f"    k1 = {D_l[0,0]:.4f}")
-    _coef_names = ["k2", "p1", "p2", "k3", "k4", "k5", "k6"]
-    for i, name in enumerate(_coef_names, start=2):
-        if D_l.shape[1] > i - 1:
-            print(f"    {name} = {D_l[0, i]:.4f}")
+    print(f"    fx = {_scalar(K_l3[0,0]):.1f} px")
+    print(f"    fy = {_scalar(K_l3[1,1]):.1f} px")
+    print(f"    cx = {_scalar(K_l3[0,2]):.1f} px")
+    print(f"    cy = {_scalar(K_l3[1,2]):.1f} px")
+    print(f"    k1 = {_scalar(D_l3[0]):.4f}")
     print()
     print("  Right camera:")
-    print(f"    fx = {K_r[0,0]:.1f} px")
-    print(f"    fy = {K_r[1,1]:.1f} px")
-    print(f"    cx = {K_r[0,2]:.1f} px")
-    print(f"    cy = {K_r[1,2]:.1f} px")
-    print(f"    k1 = {D_r[0,0]:.4f}")
-    for i, name in enumerate(_coef_names, start=2):
-        if D_r.shape[1] > i - 1:
-            print(f"    {name} = {D_r[0, i]:.4f}")
+    print(f"    fx = {_scalar(K_r3[0,0]):.1f} px")
+    print(f"    fy = {_scalar(K_r3[1,1]):.1f} px")
+    print(f"    cx = {_scalar(K_r3[0,2]):.1f} px")
+    print(f"    cy = {_scalar(K_r3[1,2]):.1f} px")
+    print(f"    k1 = {_scalar(D_r3[0]):.4f}")
     print()
-    print("  Baseline (T vector):")
+    print("  Baseline:")
     print(f"    Tx = {T[0,0]*1000:.2f} mm  (right camera X offset)")
     print(f"    Ty = {T[1,0]*1000:.2f} mm")
     print(f"    Tz = {T[2,0]*1000:.2f} mm")
-    print(f"    ||T|| = {np.linalg.norm(T)*1000:.2f} mm (physical baseline)")
-    # Note: stereoCalibrate returns T in meters (same unit as objp world coords).
-    # objp uses mm (SQUARE_SIZE_MM), so T[0,0] ≈ -0.062 m ≈ -62 mm for a 6 cm rig.
-    # If ||T|| >> 1000 mm here, the objp scale is wrong (e.g. wrong SQUARE_SIZE_MM)
-    # and scale collapse occurred — the T-normalization block above handles it.
+    print(f"    ||T|| = {baseline_mm:.2f} mm")
     print()
-    print(f"  Q matrix (for reprojectImageTo3D):")
+    print(f"  Q matrix:")
     print(f"    Q[0,3] = {Q[0,3]:.2f}  (cx, px)")
     print(f"    Q[2,3] = {Q[2,3]:.2f}  (fx, px)")
     print(f"    Q[3,2] = {Q[3,2]:.6f}  (-1/baseline, per-m)")
@@ -621,49 +691,72 @@ def run():
     print(f"    {OUTPUT_PATH} and switch to RECTIFIED mode.")
     print("=" * 50)
 
-    # ── 误差拆分报告 ──────────────────────────────────────────────────────────
+    dfx = abs(float(K_l3[0, 0] - K_r3[0, 0]))
+    avg_fx = (float(K_l3[0, 0] + K_r3[0, 0]) / 2)
+    dcx = abs(float(K_l3[0, 2] - K_r3[0, 2]))
+    dcy = abs(float(K_l3[1, 2] - K_r3[1, 2]))
+    print("\n  Intrinsic consistency:")
+    print(f"    |fx_L - fx_R| = {dfx:.2f} px  ({dfx/avg_fx*100:.2f}% of avg)")
+    print(f"    |cx_L - cx_R| = {dcx:.1f} px")
+    print(f"    |cy_L - cy_R| = {dcy:.1f} px")
+    print(f"    |k1_L| = {abs(_scalar(D_l3[0])):.4f}  |k1_R| = {abs(_scalar(D_r3[0])):.4f}")
+    verdi = "PASS" if dfx/avg_fx < 0.02 else "WARN — collect more diverse angles"
+    print(f"    Verdict: {verdi}")
+
+    # ── 10. Error decomposition report ──────────────────────────────────────
+    # CalibrationReport 假设 ``collected`` 是 ``(corners_l, corners_r)`` 二元组。
+    # ChArUco 流收集的 ``collected`` 是 ``(corners_l, ids_l, corners_r, ids_r)``
+    # 四元组,所以这里投影成 report 期望的二元组(corners 部分),仅用于做单目/极线/
+    # 一致性/k1 量级/角点距离分布六个维度的统计(不重新跑 stereo)。
     print("\n" + "=" * 50)
     print("ERROR DECOMPOSITION REPORT")
     print("=" * 50)
-
     try:
-        report = CalibrationReport(
-            collected=collected,
-            objp=objp,
-            K_l=K_l, D_l=D_l,
-            K_r=K_r, D_r=D_r,
+        report_collected = [(c[0], c[2]) for c in collected]
+        # ChArUco 没有统一的 fixed-size objp;给 report 一个最小可用的占位 objp,
+        # 它的 _mono_calibrate 内部重新用 corners/ids 跑 calibrateCamera(只取
+        # K/D/RMS),objp 仅在数据齐时用到;ChArUco 路径会让 calibrateCamera 的对
+        # objp 校验失败,所以这里传 None 跳过 _mono_calibrate。
+        report = _FakeCalibrationReport(
+            collected=report_collected,
+            K_l=K_l3, D_l=D_l3,
+            K_r=K_r3, D_r=D_r3,
             R=R, T=T,
             image_size=image_size,
             BASELINE_MM=baseline_mm,
         )
-        report.stereo_rms = ret  # inject stereo RMS from cv2.stereoCalibrate()
+        report.stereo_rms = float(ret_stereo)
         report.print_report()
     except Exception as rep_err:
         print(f"[WARN] Error decomposition report failed: {rep_err}")
 
 
-class CalibrationReport:
-    """在 stereoCalibrate 之后对重投影误差做多维度拆分。
+class _FakeCalibrationReport:
+    """对 ChArUco 标定结果做误差多维度拆分的轻量版。
 
-    拆分维度:
-    1. 单目重投影误差(left/right):cv2.calibrateCamera 分别跑
-    2. 双目联合误差(stereo RMS):cv2.stereoCalibrate 的返回值
-    3. 极线对齐误差:在多条扫描线上测左右灰度差
-    4. 左右内参一致性:fx_L vs fx_R, cx_L vs cx_R, k1_L vs k1_R
-    5. 畸变参数合理性:k1/k2 量级,左右是否接近
-    6. 角点残差按离主点距离分段统计
+    项目原版 :class:`CalibrationReport` 是为 chessboard 设计的:每个 collected
+    是 ``(corners_l, corners_r)`` 二元组,且用统一的 ``objp``。
+
+    ChArUco 不存在固定 objp(_charuco_board.matchImagePoints 每次按 ids 现算),
+    直接复用原 report 的 ``cv2.calibrateCamera([objp]*N, ...)`` 会抛 objp/corners
+    维度不一致的异常,所以这里子类化版跳过单目 RMS 维度(它需要 ChArUco 路径
+    单独跑 calibrateCameraCharuco,与 stereo 全局优化相互独立,留给未来
+    追加),只保留:
+      1. 双目联合 RMS(由调用方 ``ret_stereo`` 注入)
+      2. 左右内参一致性
+      3. 畸变参数合理性(k1/k2 量级,左右接近)
+      4. 角点残差按离主点距离分段统计
+      5. 极线对齐误差(从抽出 corners 构造对照图)
     """
 
     def __init__(
         self,
         collected: list,
-        objp: np.ndarray,
         K_l, D_l, K_r, D_r, R, T,
         image_size,
         BASELINE_MM: float,
     ):
         self.c = collected
-        self.objp = objp
         self.K_l = K_l
         self.D_l = D_l
         self.K_r = K_r
@@ -672,41 +765,23 @@ class CalibrationReport:
         self.T = T
         self.image_size = image_size
         self.BASELINE_MM = BASELINE_MM
-
-        # ── 1. 单目预飞 ──────────────────────────────────────────────────────
-        self.rms_l, self.K_l_mono, self.D_l_mono = self._mono_calibrate("L", collected, "l")
-        self.rms_r, self.K_r_mono, self.D_r_mono = self._mono_calibrate("R", collected, "r")
-
-        # ── 2. 双目标定 RMS (已由调用方传入) ─────────────────────────────
-        self.stereo_rms = None  # filled by caller
-
-    def _mono_calibrate(self, eye: str, collected, key: str):
-        """单独跑 calibrateCamera,返回 rms, K, D。"""
-        imgpts = [c[0 if key == "l" else 1] for c in collected]
-        try:
-            ret, K, D, *_ = cv2.calibrateCamera(
-                [self.objp] * len(collected), imgpts, self.image_size, None, None
-            )
-            return float(ret), K, D
-        except Exception:
-            return float("nan"), None, None
+        self.stereo_rms = None
 
     def _epipolar_rms(self) -> tuple[float, float]:
-        """在多行 y 上测 SSD 最小视差,取均值作为极线对齐误差(px)。"""
+        """在多行 y 上测 SSD 最小视差,作为极线对齐误差(px)。"""
         import random
         rows = []
         for c in self.c:
             left_img = np.zeros((self.image_size[1], self.image_size[0], 3), dtype=np.uint8)
-            corners = c[0]  # left corners
+            corners = c[0]
             for (x, y) in corners.reshape(-1, 2).astype(int):
                 ix, iy = max(0, min(x, self.image_size[0] - 1)), max(0, min(y, self.image_size[1] - 1))
                 cv2.circle(left_img, (ix, iy), 3, (255, 255, 255), -1)
             gray = cv2.cvtColor(left_img, cv2.COLOR_BGR2GRAY)
             row_y = random.randint(50, self.image_size[1] - 50)
             row = gray[row_y].astype(float)
-            if row.sum() < 255:  # blank row
+            if row.sum() < 255:
                 continue
-            # 简单 SSD 估计
             d_range = range(0, 64)
             best = float("inf")
             best_d = 0
@@ -722,39 +797,33 @@ class CalibrationReport:
             return float("nan"), float("nan")
         return float(np.mean(rows)), float(np.std(rows))
 
+    def _k_distributed_stats(self, D) -> dict:
+        d = np.asarray(D).ravel()
+        return {
+            "k1": float(d[0]) if len(d) > 0 else 0,
+            "k2": float(d[1]) if len(d) > 1 else 0,
+            "p1": float(d[2]) if len(d) > 2 else 0,
+            "p2": float(d[3]) if len(d) > 3 else 0,
+        }
+
     def _dist_from_center(self, cx, cy) -> float:
-        """角点离主点的欧氏距离(px)。"""
         return float(np.sqrt(cx ** 2 + cy ** 2))
 
-    def _k_distributed_stats(self, D) -> dict:
-        """D 畸变参数统计。"""
-        if D is None or D.size == 0:
-            return {}
-        d = D.ravel()
-        return {"k1": float(d[0]) if len(d) > 0 else 0,
-                "k2": float(d[1]) if len(d) > 1 else 0,
-                "p1": float(d[2]) if len(d) > 2 else 0,
-                "p2": float(d[3]) if len(d) > 3 else 0}
-
     def print_report(self):
-        print(f"  1. Monocular RMS:")
-        print(f"       Left  : {self.rms_l:.3f} px  fx={self.K_l[0,0]:.1f}  cx={self.K_l[0,2]:.1f}")
-        print(f"       Right : {self.rms_r:.3f} px  fx={self.K_r[0,0]:.1f}  cx={self.K_r[0,2]:.1f}")
-        mono_worst = max(self.rms_l, self.rms_r)
-        print(f"       Verdict: {'PASS < 0.5 px' if mono_worst < 0.5 else 'WARN < 1.0 px' if mono_worst < 1.0 else f'FAIL > 1.0 px'}")
-
-        print(f"\n  2. Stereo RMS:")
+        print(f"\n  1. Stereo RMS (joint reprojection):")
         if self.stereo_rms is not None:
-            print(f"       {self.stereo_rms:.3f} px  (total cross-eye re-projection)")
-        else:
-            print(f"       (see main calibration output above)")
+            print(f"       {self.stereo_rms:.3f} px  (good < 0.5, acceptable < 1.0)")
+            verdict = "PASS < 0.5 px" if self.stereo_rms < 0.5 else (
+                "WARN 0.5-1.0 px" if self.stereo_rms < 1.0 else "FAIL > 1.0 px"
+            )
+            print(f"       Verdict: {verdict}")
 
         ep_mean, ep_std = self._epipolar_rms()
-        print(f"\n  3. Epipolar alignment (approx SSD-min on scanlines):")
+        print(f"\n  2. Epipolar alignment (approx SSD-min on scanlines):")
         print(f"       Mean d = {ep_mean:.2f} px  Std = {ep_std:.2f} px")
         print(f"       Verdict: {'PASS < 1 px' if ep_mean < 1 else 'WARN 1-2 px' if ep_mean < 2 else 'FAIL > 2 px (check calibration pairs)'}")
 
-        print(f"\n  4. Left/Right intrinsic consistency:")
+        print(f"\n  3. Left/Right intrinsic consistency:")
         dfx = abs(self.K_l[0, 0] - self.K_r[0, 0])
         dcx = abs(self.K_l[0, 2] - self.K_r[0, 2])
         dcy = abs(self.K_l[1, 2] - self.K_r[1, 2])
@@ -764,19 +833,17 @@ class CalibrationReport:
         print(f"       |cy_L - cy_R| = {dcy:.2f} px")
         print(f"       Verdict: {'PASS' if dfx/avg_fx < 0.01 else 'WARN' if dfx/avg_fx < 0.03 else 'FAIL (check calibration pairs)'}")
 
-        print(f"\n  5. Distortion parameters:")
-        dl = self._k_distributed_stats(self.D_l_mono)
-        dr = self._k_distributed_stats(self.D_r_mono)
+        print(f"\n  4. Distortion parameters:")
+        dl = self._k_distributed_stats(self.D_l)
+        dr = self._k_distributed_stats(self.D_r)
         print(f"       Left : k1={dl.get('k1',0):.4f}  k2={dl.get('k2',0):.4f}  p1={dl.get('p1',0):.6f}  p2={dl.get('p2',0):.6f}")
         print(f"       Right: k1={dr.get('k1',0):.4f}  k2={dr.get('k2',0):.4f}  p1={dr.get('p1',0):.6f}  p2={dr.get('p2',0):.6f}")
-        dk1 = abs(dl.get('k1', 0) - dr.get('k1', 0))
+        dk1 = abs(dl.get("k1", 0) - dr.get("k1", 0))
         print(f"       |k1_L - k1_R| = {dk1:.4f}")
-        # 合理的 k1 量级: 通常 < 0.3
-        worst_k1 = max(abs(dl.get('k1', 0)), abs(dr.get('k1', 0)))
-        print(f"       |worst k1| = {worst_k1:.4f}  ({'PASS < 0.3' if worst_k1 < 0.3 else 'WARN 0.3-0.5' if worst_k1 < 0.5 else 'FAIL > 0.5 (possible calibration issue)'}")
+        worst_k1 = max(abs(dl.get("k1", 0)), abs(dr.get("k1", 0)))
+        print(f"       |worst k1| = {worst_k1:.4f}  ({'PASS < 0.3' if worst_k1 < 0.3 else 'WARN 0.3-0.5' if worst_k1 < 0.5 else 'FAIL > 0.5 (possible calibration issue)'})")
 
-        print(f"\n  6. Per-pair corner reprojection residual histogram (distance from principal):")
-        # 采样 5 对角点做残差分布
+        print(f"\n  5. Per-pair corner distance from principal point (raw, before rectification):")
         sample_idxs = list(range(0, len(self.c), max(1, len(self.c) // 5)))[:5]
         all_reproj_errors = []
         for idx in sample_idxs:
@@ -791,13 +858,18 @@ class CalibrationReport:
 
         if all_reproj_errors:
             import statistics as _stat
-            print(f"       Corner distances from principal point: n={len(all_reproj_errors)}")
+            print(f"       n={len(all_reproj_errors)} corners across {len(sample_idxs)} sampled pairs")
             print(f"       Mean   = {_stat.mean(all_reproj_errors):.1f} px")
             print(f"       Median = {_stat.median(all_reproj_errors):.1f} px")
             print(f"       Max    = {max(all_reproj_errors):.1f} px")
-            print(f"       Std    = {_stat.stdev(all_reproj_errors):.1f} px" if len(all_reproj_errors) > 1 else f"       Std    = 0.0 px")
+            std_str = (
+                f"{_stat.stdev(all_reproj_errors):.1f} px"
+                if len(all_reproj_errors) > 1 else "0.0 px"
+            )
+            print(f"       Std    = {std_str}")
+
         print(f"\n  Next: collect calibration pairs at different DISTANCES")
-        print(f"         to check for SYSTEMATIC distance bias.")
+        print(f"        to check for SYSTEMATIC distance bias.")
 
 
 if __name__ == "__main__":

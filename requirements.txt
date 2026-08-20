@@ -1,5 +1,9 @@
 aiohttp>=3.9.0
 opencv-python>=4.8.0
+# If you need ChArUco calibration (scripts/calibrate_stereo.py uses cv2.aruco),
+# install opencv-contrib-python instead — and pin the same version:
+#   pip install opencv-contrib-python==4.10.0.84
+# opencv-python + opencv-contrib-python cannot coexist in the same env.
 numpy>=1.24.0
 
 # WebRTC support (required for video track streaming)
