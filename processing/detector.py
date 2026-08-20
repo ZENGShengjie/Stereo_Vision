@@ -30,6 +30,8 @@ from config.hardware import (
     BASE_DIR,
 )
 
+from utils import timestamped_print
+
 logger = logging.getLogger(__name__)
 
 _DEBUG_LOG_PATH = os.path.join(
