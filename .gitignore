@@ -17,6 +17,7 @@ data/hardware_override_log.jsonl
 # Calibration artifacts — large, environment-specific, regenerated from calib capture
 config/calibration/calib.npz
 config/calibration/_debug/
+config/calibration/_debug
 
 # Runtime / debug output
 logs/
@@ -27,6 +28,7 @@ diag_frames3/
 diag_frames4/
 diag_frames5/
 diag_frames6/
+runtime_settings.py
 
 # ML model weights — large, downloaded by tooling, not source
 *.pt

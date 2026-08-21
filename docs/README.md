@@ -1,6 +1,18 @@
-# Stereo_Vision — Binocular VR Video Service
+# Stereo_Vision — 双目视觉深度测距系统
 
-Remote HCR 双目视觉服务，支持 ZED / USB 双目相机 + WebRTC 低延迟视频流 + 深度/障碍检测。
+Remote HCR 双目视觉服务，支持 USB 双目相机 + WebRTC 低延迟视频流 + YOLOv8 目标检测 + SGBM 深度测距 + 三色分级预警。
+
+---
+
+## 文档索引
+
+| 文档 | 说明 |
+|------|------|
+| **[README.md](README.md)** | 项目概述、快速开始、相机配置、API 参考 |
+| **[INSTALL.md](INSTALL.md)** | 完整安装指南（Python 依赖、ZED SDK、TLS 证书） |
+| **[PERF.md](PERF.md)** | `/perf` 性能面板使用指南：状态栏参数详解 + 调参教程 |
+| **[DEPTH_CALIBRATION.md](DEPTH_CALIBRATION.md)** | 深度校准完整指南：ChArUco 标定 + DISP_SCALE + 分段线性插值 |
+| **[540P_ABLATION.md](540P_ABLATION.md)** | 540p 降级消融实验：流畅度 vs 画质的权衡分析 |
 
 ---
 
@@ -328,3 +340,29 @@ Stereo_Vision/
 - `Client_RHCR :8000` — 单目 AprilTag 位姿 + 夹爪
 
 两服务并行部署；在 Client 设置页链到 `https://<ip>:9000/` 即可。
+
+---
+
+## 标定说明
+
+### ChArUco 标定板
+
+本项目使用 **ChArUco 标定板**（比传统棋盘格更鲁棒，支持部分遮挡）：
+
+- **规格**：7 列 × 5 行 ArUco，DICT_6X6_250
+- **方格尺寸**：Square = **40.57 mm**（默认值，需用卡尺实测）
+- **ArUco 尺寸**：Marker = **29.95 mm**（典型为方格的 0.7~0.8 倍）
+
+> ⚠️ 打印后必须用**数显游标卡尺实测**方格和 ArUco 的实际尺寸，然后修改 `config/hardware.py` 中的 `CHARUCO_SQUARE_MM` 和 `CHARUCO_MARKER_MM`。
+
+标定工具：
+```powershell
+pip install opencv-contrib-python==4.10.0.84
+python scripts/calibrate_stereo.py
+```
+
+标定完成后会生成 `config/calibration/calib.npz`，重启服务后自动加载。
+
+### 深度校准
+
+标定后还需要通过 `/perf` 页面的"焦距校准"功能校准 DISP_SCALE，详见 [DEPTH_CALIBRATION.md](DEPTH_CALIBRATION.md)。
