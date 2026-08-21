@@ -1,0 +1,29 @@
+# Normalize line endings to LF for all text files
+* text=auto
+
+# Keep certain binary-ish files as-is
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.npz  binary
+*.pem  binary
+*.pt   binary
+*.onnx binary
+*.exe  binary
+*.ico  binary
+*.gif  binary
+*.ico  binary
+
+# Scripts should always be LF
+*.py   text eol=lf
+*.ps1  text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.txt  text eol=lf
+*.gitignore text eol=lf
